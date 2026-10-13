@@ -97,8 +97,9 @@ final class OpsControllerTest extends UbixConcreteClassOrEnumTestCase implements
     private function emojiBody(string $name): string
     {
         return (new JsonService($this->createStub(Logger::class)))->encode([
+            'event_type'        => 'award',
             'merge_request'     => ['iid' => 3],
-            'object_attributes' => ['action' => 'award', 'awardable_type' => 'MergeRequest', 'name' => $name],
+            'object_attributes' => ['awardable_type' => 'MergeRequest', 'name' => $name],
             'object_kind'       => 'emoji',
             'project'           => ['id' => 7],
         ]);

@@ -168,7 +168,8 @@ final class ApprovalWebhookService
      * Whether an event is a sign-off change, and which merge request it is about
      *
      * Covers the merge-request hook (approve, un-approve) and the emoji hook (a thumbs-up
-     * awarded or revoked on a merge request).
+     * awarded or revoked on a merge request). The emoji verb is the top-level `event_type`
+     * (GitLab 19.4.2); `object_attributes.action` is read as a fallback.
      *
      * @param array<int|string, mixed> $event The decoded payload
      *
@@ -179,6 +180,7 @@ final class ApprovalWebhookService
         $attributes = is_array($event['object_attributes'] ?? null) ? $event['object_attributes'] : [];
         $action     = is_string($attributes['action'] ?? null) ? $attributes['action'] : '';
         $kind       = $event['object_kind'] ?? null;
+        $verb       = is_string($event['event_type'] ?? null) ? $event['event_type'] : $action;
 
         if ($kind === 'merge_request' && in_array($action, self::SIGN_OFF_ACTIONS, true)) {
             return [
@@ -188,13 +190,13 @@ final class ApprovalWebhookService
             ];
         }
 
-        if ($kind === 'emoji' && ($attributes['name'] ?? null) === self::SIGN_OFF_EMOJI && ($attributes['awardable_type'] ?? null) === 'MergeRequest' && in_array($action, ['award', 'revoke'], true)) {
+        if ($kind === 'emoji' && ($attributes['name'] ?? null) === self::SIGN_OFF_EMOJI && ($attributes['awardable_type'] ?? null) === 'MergeRequest' && in_array($verb, ['award', 'revoke'], true)) {
             $mergeRequest = is_array($event['merge_request'] ?? null) ? $event['merge_request'] : [];
 
             return [
-                'action'   => 'thumbsup ' . $action,
+                'action'   => 'thumbsup ' . $verb,
                 'iid'      => is_int($mergeRequest['iid'] ?? null) ? $mergeRequest['iid'] : 0,
-                'revoking' => $action === 'revoke',
+                'revoking' => $verb === 'revoke',
             ];
         }
 

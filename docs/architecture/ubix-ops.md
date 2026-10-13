@@ -82,7 +82,7 @@ internal where you can: GitLab must reach it, nobody else needs to.
 
 `ci:requireApproval` counts a `thumbsup` award as a sign-off, but the merge-request hook
 does not fire on award emoji. GitLab has a separate **Emoji events** webhook
-(`object_kind: emoji`, with `object_attributes.action` of `award` or `revoke`, and the
+(`object_kind: emoji`, with a top-level `event_type` of `award` or `revoke`, and the
 merge request under `merge_request`), and uBixOps handles it: a `thumbsup` awarded to a
 merge request is treated like an approval, and one revoked like an un-approval. Any other
 emoji, or an emoji on an issue or commit, is ignored.
@@ -94,12 +94,14 @@ emoji, or an emoji on an issue or commit, is ignored.
 - The log tells the two apart. The outcome reads `retried: job N (require-approval) for !M
   after approved` for the Approve button, and `... after thumbsup award` for a thumbs-up
   (`after unapproved` and `after thumbsup revoke` for the removals).
-- The payload shape is GitLab's: `X-Gitlab-Event: Emoji Hook` and `object_kind: emoji` as
-  documented, and (from GitLab's `Gitlab::DataBuilder::Emoji`) the awardable under its own
-  key, so a 👍 on a merge request carries `merge_request.iid`, while one on a comment is
-  `awardable_type: Note` and is ignored. The handler dispatches on `object_kind`, not the
-  header, so both hooks share the one endpoint. It has not yet been observed on a real delivery; check the first one in the webhook's
-  **Recent events** and the uBixOps log before relying on it.
+- The payload shape was verified against real GitLab 19.4.2 deliveries: `object_kind:
+  emoji`, the verb as top-level `event_type` (`award` or `revoke`), and no
+  `object_attributes.action`. `object_attributes.name` is the emoji (`thumbsup`),
+  `object_attributes.awardable_type` is `MergeRequest`, and the merge request is under
+  `merge_request.iid`; a 👍 on a comment is `awardable_type: Note` and is ignored. The
+  handler reads `event_type` and falls back to `object_attributes.action`. (Through
+  v0.46.0 it read only the latter, so no 👍 was ever recognised; fixed in v0.46.1.) It
+  dispatches on `object_kind`, not the header, so both hooks share the one endpoint.
 
 ## 5. Why it is a framework app and not a product route
 
