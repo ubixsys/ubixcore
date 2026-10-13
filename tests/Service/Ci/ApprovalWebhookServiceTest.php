@@ -229,6 +229,20 @@ final class ApprovalWebhookServiceTest extends UbixConcreteClassOrEnumTestCase i
     }
 
     /**
+     * The verb in `object_attributes.action`, the shape GitLab 19.4.2 does not send, still counts
+     *
+     * @return void
+     */
+    public function testALegacyShapedThumbsUpRetriesTheJob(): void
+    {
+        $this->givenPipeline([['id' => 12, 'name' => 'require-approval', 'status' => 'failed']]);
+
+        $result = $this->buildService()->handle(self::SECRET, $this->emojiEvent('thumbsup', 'award', 'MergeRequest', true));
+
+        $this->assertStringStartsWith('retried: job 12', $result['outcome']);
+    }
+
+    /**
      * Revoking a thumbs-up re-runs even a passed job, so the verdict can turn red
      *
      * @return void
@@ -343,17 +357,25 @@ final class ApprovalWebhookServiceTest extends UbixConcreteClassOrEnumTestCase i
      * @param string $name          The emoji
      * @param string $action        Either `award` or `revoke`
      * @param string $awardableType What it was awarded to
+     * @param bool   $legacy        Put the verb in `object_attributes.action` instead of the top-level `event_type`
      *
      * @return string The JSON payload
      */
-    private function emojiEvent(string $name, string $action, string $awardableType): string
+    private function emojiEvent(string $name, string $action, string $awardableType, bool $legacy = false): string
     {
-        return (new JsonService($this->createStub(Logger::class)))->encode([
+        $attributes = ['awardable_type' => $awardableType, 'name' => $name];
+        $event      = [
             'merge_request'     => ['iid' => 3],
-            'object_attributes' => ['action' => $action, 'awardable_type' => $awardableType, 'name' => $name],
+            'object_attributes' => $legacy ? $attributes + ['action' => $action] : $attributes,
             'object_kind'       => 'emoji',
             'project'           => ['id' => 7],
-        ]);
+        ];
+
+        if (!$legacy) {
+            $event['event_type'] = $action;
+        }
+
+        return (new JsonService($this->createStub(Logger::class)))->encode($event);
     }
 
     /**

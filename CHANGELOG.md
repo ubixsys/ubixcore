@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.46.1 - 2026-10-13
+
+### uBixOps
+
+- Fix: a 👍 on a merge request is now recognised as a sign-off. GitLab 19.4.2 sends the
+  emoji verb as top-level `event_type` (`award`/`revoke`), not `object_attributes.action`,
+  so every emoji event was answered "not an approval event". `event_type` is read first,
+  with `object_attributes.action` as the fallback.
+
 ## 0.46.0 - 2026-10-12
 
 ### uBixVault
