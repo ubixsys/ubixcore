@@ -6,9 +6,13 @@ namespace Ubix\Service;
 
 use DateTime;
 use Exception;
+use FilesystemIterator;
 use InvalidArgumentException;
 use Psr\Log\LoggerInterface as Logger;
+use RecursiveDirectoryIterator;
+use RecursiveIteratorIterator;
 use ReflectionClass;
+use SplFileInfo;
 use Symfony\Component\Console\Helper\ProgressBar;
 use Symfony\Component\Console\Output\ConsoleOutputInterface as ConsoleOutput;
 use Symfony\Component\Console\Output\OutputInterface as Output;
@@ -775,7 +779,7 @@ final class MachineCodeReviewService
             return $machineCodeReview;
         }
 
-        foreach ($this->getPhpstanFilesAnalyzed() as $path) {
+        foreach ($this->getPhpstanFilesAnalyzed($files) as $path) {
             $machineCodeReview->addTool(
                 path: $path,
                 tool: MachineCodeReviewTool::PHPSTAN,
@@ -821,24 +825,28 @@ final class MachineCodeReviewService
     }
 
     /**
-     * Get the files analyzed by PHPStan from its cache
+     * Get the files analyzed by PHPStan
      *
-     * @throws Exception If there is a problem with the PHPStan cache file
+     * A run limited to specific files never writes PHPStan's result cache (any cache on disk is stale from an earlier
+     * run), and its format is internal and changes between versions, so the cache is only trusted after a full run and
+     * only when it has the expected shape. Otherwise the files PHPStan was asked to analyze are used.
+     *
+     * @param string[] $files The files PHPStan was asked to analyze (optional) (default: [] meaning the default paths)
      *
      * @return string[] The files analyzed by PHPStan
      */
-    private function getPhpstanFilesAnalyzed(): array
+    private function getPhpstanFilesAnalyzed(array $files = []): array
     {
+        if (count($files) > 0) {
+            return array_values(array_unique($files));
+        }
+
         $phpstanCachePath = '.phpstan.cache'; // NOT_IMPLEMENTED: read this direct from phpstan.neon - I don't want it hardcoded (DRY violation)
 
         $cacheFile = $this->projectRoot->getPath($phpstanCachePath, 'resultCache.php');
-        if (!file_exists($cacheFile)) {
-            throw new Exception('PHPStan cache file does not exist at `' . $cacheFile . '`');
-        }
-
-        $cache = require $cacheFile;
+        $cache     = is_file($cacheFile) ? @include $cacheFile : null; // phpcs:ignore Generic.PHP.NoSilencedErrors.Discouraged -- a truncated or foreign-format cache must degrade, not crash
         if (!is_array($cache)) {
-            throw new Exception('PHPStan cache is not an array');
+            return $this->getPhpstanDefaultFiles();
         }
 
         // PHPStan’s cache is an array; one entry carries the dependency tree of project files.
@@ -858,7 +866,30 @@ final class MachineCodeReviewService
             }
         }
 
-        return array_values(array_unique(array_filter($all, 'is_string')));
+        return count($all) > 0 ? array_values(array_unique($all)) : $this->getPhpstanDefaultFiles();
+    }
+
+    /**
+     * Get the PHP files under the default paths PHPStan analyzes
+     *
+     * @return string[] The files
+     */
+    private function getPhpstanDefaultFiles(): array
+    {
+        $found = [];
+        foreach (self::PHPSTAN_DEFAULT_FILES as $dir) {
+            $path = $this->projectRoot->getPath($dir);
+            if (!is_dir($path)) {
+                continue; // A framework-only checkout has no app/
+            }
+            foreach (new RecursiveIteratorIterator(new RecursiveDirectoryIterator($path, FilesystemIterator::SKIP_DOTS)) as $file) {
+                if ($file instanceof SplFileInfo && $file->isFile() && $file->getExtension() === 'php') {
+                    $found[] = $file->getPathname();
+                }
+            }
+        }
+
+        return $found;
     }
 
     /**
