@@ -1,0 +1,851 @@
+# uBixCore shared CI pipeline template.
+#
+#   build → test → migrate → deploy → promote → notify   (+ approval, maintenance)
+#
+# Consume it from a host repo, pinned to a framework release tag (never main):
+#
+#   include:
+#     - project: ubixsys/ubixcore
+#       ref: v0.46.0
+#       file: ci/ubixcore-pipeline.yml
+#
+# Everything a host tunes is a UBIX_* variable (section 1). Hidden `.ubix_*` jobs are
+# public API: `extends:` them to add a job, redefine a concrete job by name to change it,
+# or redefine it with `rules: [{ when: never }]` to drop it. Spec and rationale:
+# docs/design/ci-pipeline-template.md. What the host must provide (Dockerfiles, app/*/
+# <tier>-deploy.yaml, bin/deploy.sh, bin/promote.sh, bin/lib/notify.sh, a uBixVault tree
+# under secret/<UBIX_VAULT_PREFIX>/) is section 3.6 of that doc.
+#
+# Credentials never live here: the jobs read them from uBixVault through the host's
+# bin/lib/notify.sh (`vault_kv`, `discord`) with the read-only CI tokens
+# UBIXVAULT_CI_TOKEN_DEV / UBIXVAULT_CI_TOKEN_PROD (masked GitLab variables).
+
+# ---------------------------------------------------------------------------
+# 1. Variables (override in the host's own `variables:`; project variables win)
+# ---------------------------------------------------------------------------
+variables:
+  UBIX_BUILD_TAG: shell                 # runner tag: jobs that build or run an image
+  UBIX_DEPLOY_TAG: shell                # runner tag: kubectl jobs (deploy, promote, notify)
+  UBIX_DEV_BRANCH: dev
+  UBIX_STAGING_BRANCH: staging
+  UBIX_PROD_BRANCH: main                # `master` is also accepted for prod
+  UBIX_TIERS: "dev,staging,prod"        # tiers that get jobs; drop one to drop its jobs
+  UBIX_RUNTIME_DOCKERFILE_DEV: Dockerfile
+  UBIX_RUNTIME_DOCKERFILE_STAGING: Dockerfile_Staging
+  UBIX_RUNTIME_DOCKERFILE_PROD: Dockerfile_Main
+  UBIX_TEST_DOCKERFILE: Dockerfile_Test
+  UBIX_NODE_DOCKERFILE: Dockerfile_Node # one per app/*Js, parameterised by APP_DIR
+  UBIX_GO_DOCKERFILE: Dockerfile_Go     # one per app/*Go, parameterised by APP_DIR
+  UBIX_BUILD_PLATFORMS: "linux/amd64,linux/arm64"  # the MR build is always amd64
+  UBIX_CACHE_IMAGE: ""                  # registry cache repo, e.g. harbor.example/x/cache; empty = no cache
+  UBIX_VAULT_PREFIX: $CI_PROJECT_NAME   # secret/<prefix>/{db-<tier>,test-db,composer}
+  UBIX_MIGRATE_ENABLED: "true"          # "false" removes every migrate job (no database)
+  UBIX_DRIFT_ENABLED: "false"           # "true" adds drift-<tier> (replay migrations, diff live)
+  UBIX_PROD_DEPLOY_WHEN: manual         # manual | on_success
+  UBIX_APP_DB_HOST: ""                  # grants host pattern; empty = "%" on dev, "10.50.%" elsewhere
+  UBIX_APPROVAL_OWNERS: ""              # usernames whose Approve/👍 counts; required by require-approval-mr
+  UBIX_NOTIFY_SCRIPT: bin/lib/notify.sh
+  UBIX_DEPLOY_SCRIPT: bin/deploy.sh
+  UBIX_PROMOTE_SCRIPT: bin/promote.sh
+  UBIX_PHPSTAN_PATHS: "app bin php public tests"
+  UBIX_JS_TEST_SKIP: ""                 # app/*Js names whose `npm test` cannot run in the plain node image
+  UBIX_AI_REVIEW_GUIDE: bin/ci/ai-review-guide.md  # host rules for ci:aiReview; ignored if the file is absent
+
+stages:
+  - build
+  - test
+  - migrate
+  - deploy
+  - promote
+  - notify
+  - approval
+  - maintenance
+
+# Pipelines for MR events, schedules (maintenance only) and pushes to the tier branches.
+# A feature-branch push produces none.
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_COMMIT_BRANCH == $UBIX_DEV_BRANCH || $CI_COMMIT_BRANCH == $UBIX_STAGING_BRANCH || $CI_COMMIT_BRANCH == $UBIX_PROD_BRANCH || $CI_COMMIT_BRANCH == "master"
+
+# Every job retries twice on infrastructure-class failures so a runner hiccup never needs
+# a human click. Genuine red stays red. Interruptible so a superseded pipeline frees its
+# runner; migrate, deploy, promote and notify opt out (half a deploy is worse than a slow one).
+default:
+  interruptible: true
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+      - api_failure
+      - scheduler_failure
+      - unknown_failure
+
+# ---------------------------------------------------------------------------
+# 2. Hidden building blocks
+# ---------------------------------------------------------------------------
+
+# Registry login lives only in jobs that pull or push an image (not deploy/promote/notify),
+# so a registry outage cannot fail a deploy.
+.ubix_registry_login:
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" $CI_REGISTRY
+
+# Apps are found by name suffix (app/FooJs, app/FooGo), never by a hand-kept list.
+# Use as: script: [!reference [.ubix_apps_fn, script], "..."]
+.ubix_apps_fn:
+  script:
+    - |
+      apps_with_suffix() { for d in app/*"$1"/; do [ -d "$d" ] && basename "$d"; done; return 0; }
+
+# The rule conditions, written once. Branch conditions never match schedules.
+.ubix_if:
+  dev: &if_dev '$CI_PIPELINE_SOURCE != "schedule" && $CI_COMMIT_BRANCH == $UBIX_DEV_BRANCH && $UBIX_TIERS =~ /(^|,)dev(,|$)/'
+  staging: &if_staging '$CI_PIPELINE_SOURCE != "schedule" && $CI_COMMIT_BRANCH == $UBIX_STAGING_BRANCH && $UBIX_TIERS =~ /(^|,)staging(,|$)/'
+  prod: &if_prod '$CI_PIPELINE_SOURCE != "schedule" && ($CI_COMMIT_BRANCH == $UBIX_PROD_BRANCH || $CI_COMMIT_BRANCH == "master") && $UBIX_TIERS =~ /(^|,)prod(,|$)/'
+  mr: &if_mr '$CI_PIPELINE_SOURCE == "merge_request_event"'
+  migrate_dev: &if_migrate_dev '$CI_PIPELINE_SOURCE != "schedule" && $CI_COMMIT_BRANCH == $UBIX_DEV_BRANCH && $UBIX_TIERS =~ /(^|,)dev(,|$)/ && $UBIX_MIGRATE_ENABLED == "true"'
+  migrate_staging: &if_migrate_staging '$CI_PIPELINE_SOURCE != "schedule" && $CI_COMMIT_BRANCH == $UBIX_STAGING_BRANCH && $UBIX_TIERS =~ /(^|,)staging(,|$)/ && $UBIX_MIGRATE_ENABLED == "true"'
+  migrate_prod: &if_migrate_prod '$CI_PIPELINE_SOURCE != "schedule" && ($CI_COMMIT_BRANCH == $UBIX_PROD_BRANCH || $CI_COMMIT_BRANCH == "master") && $UBIX_TIERS =~ /(^|,)prod(,|$)/ && $UBIX_MIGRATE_ENABLED == "true"'
+  drift_dev: &if_drift_dev '$CI_PIPELINE_SOURCE != "schedule" && $CI_COMMIT_BRANCH == $UBIX_DEV_BRANCH && $UBIX_TIERS =~ /(^|,)dev(,|$)/ && $UBIX_MIGRATE_ENABLED == "true" && $UBIX_DRIFT_ENABLED == "true"'
+  drift_staging: &if_drift_staging '$CI_PIPELINE_SOURCE != "schedule" && $CI_COMMIT_BRANCH == $UBIX_STAGING_BRANCH && $UBIX_TIERS =~ /(^|,)staging(,|$)/ && $UBIX_MIGRATE_ENABLED == "true" && $UBIX_DRIFT_ENABLED == "true"'
+  drift_prod: &if_drift_prod '$CI_PIPELINE_SOURCE != "schedule" && ($CI_COMMIT_BRANCH == $UBIX_PROD_BRANCH || $CI_COMMIT_BRANCH == "master") && $UBIX_TIERS =~ /(^|,)prod(,|$)/ && $UBIX_MIGRATE_ENABLED == "true" && $UBIX_DRIFT_ENABLED == "true"'
+  prod_auto: &if_prod_auto '$CI_PIPELINE_SOURCE != "schedule" && ($CI_COMMIT_BRANCH == $UBIX_PROD_BRANCH || $CI_COMMIT_BRANCH == "master") && $UBIX_TIERS =~ /(^|,)prod(,|$)/ && $UBIX_PROD_DEPLOY_WHEN == "on_success"'
+
+# Tier selectors: rules plus the per-tier variables the shared scripts read.
+.ubix_on_dev:
+  variables:
+    UBIX_TIER: dev
+    UBIX_RUNTIME_DOCKERFILE: $UBIX_RUNTIME_DOCKERFILE_DEV
+    UBIX_JOB_PLATFORMS: $UBIX_BUILD_PLATFORMS
+  rules:
+    - if: *if_dev
+
+.ubix_on_staging:
+  variables:
+    UBIX_TIER: staging
+    UBIX_RUNTIME_DOCKERFILE: $UBIX_RUNTIME_DOCKERFILE_STAGING
+    UBIX_JOB_PLATFORMS: $UBIX_BUILD_PLATFORMS
+  rules:
+    - if: *if_staging
+
+.ubix_on_prod:
+  variables:
+    UBIX_TIER: prod
+    UBIX_RUNTIME_DOCKERFILE: $UBIX_RUNTIME_DOCKERFILE_PROD
+    UBIX_JOB_PLATFORMS: $UBIX_BUILD_PLATFORMS
+  rules:
+    - if: *if_prod
+
+# Nothing deploys from an MR and the runners are amd64, so the MR build skips arm64.
+.ubix_on_mr:
+  variables:
+    UBIX_TIER: mr
+    UBIX_RUNTIME_DOCKERFILE: $UBIX_RUNTIME_DOCKERFILE_DEV
+    UBIX_JOB_PLATFORMS: linux/amd64
+  rules:
+    - if: *if_mr
+
+# ---------------------------------------------------------------------------
+# build — runtime image (`:<slug>`, `:<slug>-<sha>`), a `-test` image layered on it
+# (`:<sha>-test`, amd64), and per app/*Js / app/*Go a runtime image plus a `-ci` image.
+# ---------------------------------------------------------------------------
+.ubix_build:
+  extends: .ubix_registry_login
+  stage: build
+  tags: [$UBIX_BUILD_TAG]
+  # Registry/network blips during docker push present as script failures, so build
+  # jobs retry those too.
+  retry:
+    max: 2
+    when:
+      - script_failure
+      - runner_system_failure
+      - stuck_or_timeout_failure
+      - api_failure
+      - scheduler_failure
+      - unknown_failure
+  script:
+    - !reference [.ubix_apps_fn, script]
+    - |
+      set -euo pipefail
+      RUNTIME_REF="${CI_REGISTRY_IMAGE}:${CI_COMMIT_REF_SLUG}"
+      RUNTIME_SHA_REF="${CI_REGISTRY_IMAGE}:${CI_COMMIT_REF_SLUG}-${CI_COMMIT_SHA}"
+      TEST_REF="${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHA}-test"
+      NODE_REF="${CI_REGISTRY_IMAGE}:${CI_COMMIT_REF_SLUG}-node"
+      NODE_SHA_REF="${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHA}-node"
+      JS_APPS="$(apps_with_suffix Js | tr '\n' ' ')"
+      GO_APPS="$(apps_with_suffix Go | tr '\n' ' ')"
+      PLATFORMS="$UBIX_JOB_PLATFORMS"
+      # Optional registry cache; a cache outage must never fail a build.
+      cache_args() {
+        [ -n "${UBIX_CACHE_IMAGE:-}" ] || return 0
+        printf '%s\n' "--cache-from=type=registry,ref=${UBIX_CACHE_IMAGE}:$1" \
+          "--cache-to=type=registry,ref=${UBIX_CACHE_IMAGE}:$1,mode=max,ignore-error=true"
+      }
+
+      # uBixCore comes from the private ubixsys group Composer registry. Auth is a
+      # BuildKit secret (never a layer): a deploy token from uBixVault
+      # (secret/<prefix>/composer: username + token, read_package_registry) if present,
+      # else this job's CI_JOB_TOKEN (needs this project on ubixcore's job-token allowlist).
+      SCRIPT_DIR="$CI_PROJECT_DIR"; . "$UBIX_NOTIFY_SCRIPT"; export VAULT_KV_PREFIX="$UBIX_VAULT_PREFIX"
+      CU="$(vault_kv composer username)"; CT="$(vault_kv composer token)"
+      if [ -n "$CT" ]; then AUTH_USER="$CU"; AUTH_TOKEN="$CT"; else AUTH_USER="gitlab-ci-token"; AUTH_TOKEN="$CI_JOB_TOKEN"; fi
+      AUTH_FILE="$(mktemp)"; trap 'rm -f "$AUTH_FILE"' EXIT
+      printf '{"gitlab-token":{"%s":{"username":"%s","token":"%s"}}}' "$CI_SERVER_HOST" "$AUTH_USER" "$AUTH_TOKEN" > "$AUTH_FILE"
+
+      # --pull: resolve the base image afresh so a runtime update reaches the next build.
+      docker buildx build --pull --provenance=false --sbom=false --platform "$PLATFORMS" --push \
+        $(cache_args runtime) \
+        --secret id=composer_auth,src="$AUTH_FILE" \
+        -t "$RUNTIME_REF" -t "$RUNTIME_SHA_REF" -f "$UBIX_RUNTIME_DOCKERFILE" .
+      docker buildx build --provenance=false --sbom=false --platform linux/amd64 --push \
+        --build-arg RUNTIME_IMAGE="$RUNTIME_SHA_REF" \
+        -t "$TEST_REF" -f "$UBIX_TEST_DOCKERFILE" .
+
+      # TWO images per JS app, from one Dockerfile:
+      #   -ci       the `build` stage, devDependencies intact: what the gate runs eslint /
+      #             tsc / vitest in. amd64 only; never deployed.
+      #   (runtime) the pruned production image the Deployments pull.
+      # The per-commit tag forces a registry pull (buildx pushes without loading locally).
+      for APP in $JS_APPS; do
+        SLUG="$(printf '%s' "$APP" | tr '[:upper:]' '[:lower:]')"
+        docker buildx build --provenance=false --sbom=false --platform linux/amd64 --push \
+          --target build --build-arg "APP_DIR=app/${APP}" \
+          -t "${NODE_SHA_REF}-${SLUG}-ci" -f "$UBIX_NODE_DOCKERFILE" .
+        docker buildx build --provenance=false --sbom=false --platform "$PLATFORMS" --push \
+          $(cache_args "node-${SLUG}") \
+          --build-arg "APP_DIR=app/${APP}" \
+          -t "${NODE_REF}-${SLUG}" -t "${NODE_SHA_REF}-${SLUG}" -f "$UBIX_NODE_DOCKERFILE" .
+      done
+      # Go apps: the same two-image model from one Dockerfile.
+      for APP in $GO_APPS; do
+        SLUG="$(printf '%s' "$APP" | tr '[:upper:]' '[:lower:]')"
+        docker buildx build --provenance=false --sbom=false --platform linux/amd64 --push \
+          --target ci --build-arg "APP_DIR=app/${APP}" \
+          -t "${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHA}-go-${SLUG}-ci" -f "$UBIX_GO_DOCKERFILE" .
+        docker buildx build --provenance=false --sbom=false --platform "$PLATFORMS" --push \
+          $(cache_args "go-${SLUG}") \
+          --build-arg "APP_DIR=app/${APP}" \
+          -t "${CI_REGISTRY_IMAGE}:${CI_COMMIT_REF_SLUG}-go-${SLUG}" \
+          -t "${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHA}-go-${SLUG}" -f "$UBIX_GO_DOCKERFILE" .
+      done
+
+build-dev:     { extends: [.ubix_build, .ubix_on_dev] }
+build-staging: { extends: [.ubix_build, .ubix_on_staging] }
+build-prod:    { extends: [.ubix_build, .ubix_on_prod] }
+build-mr:      { extends: [.ubix_build, .ubix_on_mr] }
+
+# ---------------------------------------------------------------------------
+# test — runs inside the images the build stage pushed
+# ---------------------------------------------------------------------------
+.ubix_static_checks:
+  extends: .ubix_registry_login
+  stage: test
+  tags: [$UBIX_BUILD_TAG]
+  timeout: 15 minutes
+  script:
+    - |
+      docker run --rm --workdir /web \
+        "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA-test" \
+        sh -c "set -e && vendor/bin/phpcs --no-cache && vendor/bin/phpstan analyse --no-progress --memory-limit=2G $UBIX_PHPSTAN_PATHS"
+
+# PHPUnit against the unit-test MariaDB. Credentials come from uBixVault
+# secret/<prefix>/test-db via the branch's read-only CI token. The test schema is rebuilt
+# from the baseline and migrations on every run.
+.ubix_phpunit:
+  extends: .ubix_registry_login
+  stage: test
+  tags: [$UBIX_BUILD_TAG]
+  timeout: 30 minutes
+  script:
+    - |
+      set -u; SCRIPT_DIR="$CI_PROJECT_DIR"; . "$UBIX_NOTIFY_SCRIPT"; export VAULT_KV_PREFIX="$UBIX_VAULT_PREFIX"
+      export TEST_MYSQL_WRITE_HOST="$(vault_kv test-db host)" TEST_MYSQL_WRITE_PORT="$(vault_kv test-db port)"
+      export TEST_MYSQL_WRITE_USERNAME="$(vault_kv test-db username)" TEST_MYSQL_WRITE_PASSWORD="$(vault_kv test-db password)"
+      export TEST_MYSQL_WRITE_DATABASE="$(vault_kv test-db database)"
+      [ -n "$TEST_MYSQL_WRITE_HOST" ] || { echo "no test-db credentials from vault (secret/$UBIX_VAULT_PREFIX/test-db)"; exit 1; }
+      docker run --rm --workdir /web \
+        -e TEST_MYSQL_WRITE_HOST -e TEST_MYSQL_WRITE_PORT -e TEST_MYSQL_WRITE_DATABASE \
+        -e TEST_MYSQL_WRITE_USERNAME -e TEST_MYSQL_WRITE_PASSWORD \
+        "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA-test" \
+        sh -c "set -e && { [ -f /web/.env ] && sed -i 's/^TEST_MYSQL_/#&/' /web/.env || true; } \\
+          && php bin/ubix database:resetSchema test -n \\
+          && mysql -h \$TEST_MYSQL_WRITE_HOST -P \$TEST_MYSQL_WRITE_PORT -u \$TEST_MYSQL_WRITE_USERNAME -p\$TEST_MYSQL_WRITE_PASSWORD -e 'CREATE DATABASE IF NOT EXISTS SYSTEMS' \\
+          && php bin/ubix migrate:up --target=test --yes -n \\
+          && vendor/bin/phpunit"
+
+# Per-app JS gate, in the `-ci` image (devDependencies intact; the runtime image has no
+# eslint, tsc or vitest). `lint` + `check` always; `npm test` unless the app is in
+# UBIX_JS_TEST_SKIP.
+.ubix_js_lint:
+  extends: .ubix_registry_login
+  stage: test
+  tags: [$UBIX_BUILD_TAG]
+  timeout: 20 minutes
+  script:
+    - !reference [.ubix_apps_fn, script]
+    - |
+      set -euo pipefail
+      JS_APPS="$(apps_with_suffix Js | tr '\n' ' ')"
+      [ -n "$JS_APPS" ] || { echo "no app/*Js"; exit 0; }
+      for APP in $JS_APPS; do
+        SLUG="$(printf '%s' "$APP" | tr '[:upper:]' '[:lower:]')"
+        echo "--- $APP ---"
+        CMD="npm run lint && npm run check"
+        case " $UBIX_JS_TEST_SKIP " in *" $APP "*) ;; *) CMD="$CMD && npm test" ;; esac
+        docker run --rm --workdir /app "${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHA}-node-${SLUG}-ci" \
+          sh -c "set -e && $CMD"
+      done
+
+# Per-app Go gate, in the `-ci` image: golangci-lint (covers formatting) + go test.
+.ubix_go_checks:
+  extends: .ubix_registry_login
+  stage: test
+  tags: [$UBIX_BUILD_TAG]
+  timeout: 15 minutes
+  script:
+    - !reference [.ubix_apps_fn, script]
+    - |
+      set -euo pipefail
+      GO_APPS="$(apps_with_suffix Go | tr '\n' ' ')"
+      [ -n "$GO_APPS" ] || { echo "no app/*Go"; exit 0; }
+      for APP in $GO_APPS; do
+        SLUG="$(printf '%s' "$APP" | tr '[:upper:]' '[:lower:]')"
+        echo "--- $APP ---"
+        docker run --rm --workdir /src "${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHA}-go-${SLUG}-ci" \
+          sh -c "set -e && golangci-lint run ./... && go test ./..."
+      done
+
+static-checks-dev:     { extends: [.ubix_static_checks, .ubix_on_dev],     needs: [build-dev] }
+static-checks-staging: { extends: [.ubix_static_checks, .ubix_on_staging], needs: [build-staging] }
+static-checks-prod:    { extends: [.ubix_static_checks, .ubix_on_prod],    needs: [build-prod] }
+static-checks-mr:      { extends: [.ubix_static_checks, .ubix_on_mr],      needs: [build-mr] }
+
+phpunit-dev:     { extends: [.ubix_phpunit, .ubix_on_dev],     needs: [build-dev] }
+phpunit-staging: { extends: [.ubix_phpunit, .ubix_on_staging], needs: [build-staging] }
+phpunit-prod:    { extends: [.ubix_phpunit, .ubix_on_prod],    needs: [build-prod] }
+
+# phpunit on an MR runs the suite ONLY: no vault read, no schema reset. The tier job's
+# vault token is a protected variable and so absent on an unprotected feature branch;
+# migrations have their own blocking stage on the tier branches.
+phpunit-mr:
+  extends: [.ubix_phpunit, .ubix_on_mr]
+  needs: [build-mr]
+  script:
+    - |
+      docker run --rm --workdir /web \
+        "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA-test" \
+        sh -c "set -e && vendor/bin/phpunit"
+
+# js-lint / go-checks exist only where the repo has such an app.
+js-lint-dev:
+  extends: [.ubix_js_lint, .ubix_on_dev]
+  needs: [build-dev]
+  rules: [{ if: *if_dev, exists: ['app/*Js/package.json'] }]
+js-lint-staging:
+  extends: [.ubix_js_lint, .ubix_on_staging]
+  needs: [build-staging]
+  rules: [{ if: *if_staging, exists: ['app/*Js/package.json'] }]
+js-lint-prod:
+  extends: [.ubix_js_lint, .ubix_on_prod]
+  needs: [build-prod]
+  rules: [{ if: *if_prod, exists: ['app/*Js/package.json'] }]
+js-lint-mr:
+  extends: [.ubix_js_lint, .ubix_on_mr]
+  needs: [build-mr]
+  rules: [{ if: *if_mr, exists: ['app/*Js/package.json'] }]
+
+go-checks-dev:
+  extends: [.ubix_go_checks, .ubix_on_dev]
+  needs: [build-dev]
+  rules: [{ if: *if_dev, exists: ['app/*Go/go.mod'] }]
+go-checks-staging:
+  extends: [.ubix_go_checks, .ubix_on_staging]
+  needs: [build-staging]
+  rules: [{ if: *if_staging, exists: ['app/*Go/go.mod'] }]
+go-checks-prod:
+  extends: [.ubix_go_checks, .ubix_on_prod]
+  needs: [build-prod]
+  rules: [{ if: *if_prod, exists: ['app/*Go/go.mod'] }]
+go-checks-mr:
+  extends: [.ubix_go_checks, .ubix_on_mr]
+  needs: [build-mr]
+  rules: [{ if: *if_mr, exists: ['app/*Go/go.mod'] }]
+
+# Advisory AI review (`bin/ubix ci:aiReview`; wiring in docs/standards/ai-review-in-ci.md).
+# Never a gate: allow_failure, and with no keys it skips green. Needs the masked,
+# deliberately NOT protected variables GEMINI_API_KEY and AI_REVIEW_GITLAB_TOKEN
+# (MR branches are unprotected, so a protected variable would never reach this job).
+# Optional AI_REVIEW_MODEL. Runs in the MR's own -test image.
+ai-review-mr:
+  extends: [.ubix_registry_login, .ubix_on_mr]
+  stage: test
+  tags: [$UBIX_BUILD_TAG]
+  needs: [build-mr]
+  allow_failure: true
+  timeout: 10 minutes
+  script:
+    - |
+      set -euo pipefail
+      if [ -z "${GEMINI_API_KEY:-}" ] || [ -z "${AI_REVIEW_GITLAB_TOKEN:-}" ]; then
+        echo "ai-review: skipped -- GEMINI_API_KEY / AI_REVIEW_GITLAB_TOKEN not set"; exit 0
+      fi
+      GUIDE=""; [ -f "$UBIX_AI_REVIEW_GUIDE" ] && GUIDE="--guide=$UBIX_AI_REVIEW_GUIDE"
+      git fetch -q --depth=1 origin "$CI_MERGE_REQUEST_DIFF_BASE_SHA"
+      git diff "$CI_MERGE_REQUEST_DIFF_BASE_SHA" HEAD -- . \
+        ':(exclude)docs' ':(exclude)composer.lock' ':(exclude)**/package-lock.json' \
+        > "$CI_PROJECT_DIR/ai-review.diff"
+      docker run --rm -i --workdir /web \
+        -e GEMINI_API_KEY -e AI_REVIEW_GITLAB_TOKEN -e AI_REVIEW_MODEL \
+        -e CI_API_V4_URL -e CI_PROJECT_ID -e CI_MERGE_REQUEST_IID -e CI_MERGE_REQUEST_TITLE -e CI_COMMIT_SHA \
+        "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA-test" \
+        php bin/ubix ci:aiReview $GUIDE < "$CI_PROJECT_DIR/ai-review.diff"
+
+# ---------------------------------------------------------------------------
+# migrate — apply sql/migrations to the tier's database BEFORE the deploy.
+#
+#   migrate-verify-<tier>   read-only `migrate:status --verify` (checksums of applied files)
+#                           after the host cross-check; gates the deploy
+#   migrate-apply-<tier>    `migrate:up` WITHOUT the acknowledgement: on staging/prod a
+#                           pending `Destructive:` migration HOLDS (job fails, deploy does
+#                           not run, #ops is told)
+#   migrate-apply-<tier>-destructive
+#                           manual; same with --i-acknowledge-destructive (the framework
+#                           snapshots the affected tables first). After it succeeds, retry
+#                           migrate-apply-<tier> (nothing left pending) to unblock the deploy.
+#   migrate-apply-prod      manual (a person decides when production schema changes)
+#
+# Credentials: uBixVault secret/<prefix>/db-<tier> (host, port, database, write_username,
+# write_password, optional migration_username/migration_password = a dedicated DDL user).
+# ---------------------------------------------------------------------------
+.ubix_migrate:
+  extends: .ubix_registry_login
+  stage: migrate
+  tags: [$UBIX_BUILD_TAG]
+  # Never cancelled mid-flight: a half-applied migration is worse than a superseded one.
+  interruptible: false
+  timeout: 30 minutes
+  variables:
+    UBIX_MIGRATE_MODE: apply   # verify | apply
+    MIGRATE_ACK: ""            # --i-acknowledge-destructive on the *-destructive jobs
+  script:
+    - |
+      set -u; SCRIPT_DIR="$CI_PROJECT_DIR"; . "$UBIX_NOTIFY_SCRIPT"; export VAULT_KV_PREFIX="$UBIX_VAULT_PREFIX"
+      T="$UBIX_TIER"
+      export MYSQL_WRITE_HOST="$(vault_kv db-$T host)" MYSQL_WRITE_PORT="$(vault_kv db-$T port)"
+      export MYSQL_WRITE_DATABASE="$(vault_kv db-$T database)"
+      export MYSQL_WRITE_USERNAME="$(vault_kv db-$T write_username)" MYSQL_WRITE_PASSWORD="$(vault_kv db-$T write_password)"
+      export MYSQL_MIGRATION_USERNAME="$(vault_kv db-$T migration_username)" MYSQL_MIGRATION_PASSWORD="$(vault_kv db-$T migration_password)"
+      [ -n "$MYSQL_WRITE_HOST" ] || { echo "no db-$T credentials from vault (secret/$UBIX_VAULT_PREFIX/db-$T)"; exit 1; }
+
+      # Host cross-check. The host a tier MIGRATES (this vault secret) and the host its
+      # pods READ (MYSQL_WRITE_HOST in app/*/<ref>-deploy.yaml) come from two places;
+      # a mismatch is silent in the worst way: migrations go green against one box, the
+      # deploy goes green, the app 500s on a column that exists on the other. Fatal, not
+      # a warning, and finding nothing is fatal too (a guard that quietly stops guarding
+      # is worse than none). Manifests are named after the branch slug (main-deploy.yaml
+      # for prod); the glob is literal because a variable holding a glob expands in bash
+      # but not in zsh.
+      MANIFEST_PREFIX="$CI_COMMIT_REF_SLUG"
+      MANIFEST_HOSTS="$(for f in app/*/"$MANIFEST_PREFIX"-deploy.yaml; do
+        [ -f "$f" ] || continue
+        grep -A1 -h 'name: MYSQL_WRITE_HOST' "$f" || true
+      done | { grep 'value:' || true; } | sed -e 's/.*value: *"*//' -e 's/"*$//' | sort -u)"
+      MANIFEST_COUNT="$(printf '%s\n' "$MANIFEST_HOSTS" | grep -c . || true)"
+      if [ "$MANIFEST_COUNT" -eq 0 ]; then
+        echo "REFUSING TO MIGRATE: found no MYSQL_WRITE_HOST in app/*/$MANIFEST_PREFIX-deploy.yaml."
+        echo "The host cross-check cannot run, so it is not safe to assume the targets agree."
+        exit 1
+      elif [ "$MANIFEST_COUNT" -gt 1 ]; then
+        echo "REFUSING TO MIGRATE: $MANIFEST_PREFIX-*.yaml manifests name more than one database host:"
+        printf '  %s\n' $MANIFEST_HOSTS
+        exit 1
+      elif [ "$MANIFEST_HOSTS" != "$MYSQL_WRITE_HOST" ]; then
+        echo "REFUSING TO MIGRATE: the $T migration target and its pods disagree."
+        echo "  vault  secret/$UBIX_VAULT_PREFIX/db-$T host : $MYSQL_WRITE_HOST"
+        echo "  manifests app/*/$MANIFEST_PREFIX-deploy.yaml : $(echo "$MANIFEST_HOSTS" | tr '\n' ' ')"
+        echo "Set both to the same server. Migrating one while the app reads the other"
+        echo "fails silently later, which is why this is fatal rather than a warning."
+        exit 1
+      else
+        echo "host cross-check OK: $T migrates and serves from $MYSQL_WRITE_HOST"
+      fi
+
+      # App-grants host part for sql/grants/app.sql (not a secret).
+      APP_DB_HOST="${UBIX_APP_DB_HOST:-}"
+      if [ -z "$APP_DB_HOST" ]; then if [ "$T" = dev ]; then APP_DB_HOST='%'; else APP_DB_HOST='10.50.%'; fi; fi
+      export APP_DB_HOST
+      export DDL_USER="${MYSQL_MIGRATION_USERNAME:-$MYSQL_WRITE_USERNAME}" DDL_PASS="${MYSQL_MIGRATION_PASSWORD:-$MYSQL_WRITE_PASSWORD}"
+      export UBIX_TIER UBIX_MIGRATE_MODE MIGRATE_ACK
+
+      # What runs in the container. Single-quoted heredoc: nothing expands here.
+      INNER="$(cat <<'EOS'
+      set -e
+      if [ "$UBIX_MIGRATE_MODE" = verify ]; then
+        php bin/ubix migrate:status --target="$UBIX_TIER" --verify -n
+        exit 0
+      fi
+      (mysql -h "$MYSQL_WRITE_HOST" -P "$MYSQL_WRITE_PORT" -u "$DDL_USER" -p"$DDL_PASS" -e 'CREATE DATABASE IF NOT EXISTS SYSTEMS' || echo 'SYSTEMS: not created by this user (must already exist)')
+      php bin/ubix migrate:status --target="$UBIX_TIER" -n
+      if [ -z "$MIGRATE_ACK" ] && [ "$UBIX_TIER" != dev ]; then
+        if php bin/ubix migrate:status --target="$UBIX_TIER" --destructive-pending -n | grep -q 'DESTRUCTIVE_MIGRATION=true'; then
+          echo "HELD: a pending migration is marked Destructive:. Nothing was applied."
+          echo "Run migrate-apply-$UBIX_TIER-destructive to acknowledge it, then retry migrate-apply-$UBIX_TIER."
+          exit 1
+        fi
+      fi
+      php bin/ubix migrate:up --target="$UBIX_TIER" --yes -n $MIGRATE_ACK
+      # sql/grants/app.sql: grants the app user needs outside its own schema. Idempotent.
+      # A DDL account without GRANT OPTION WARNS and continues.
+      if [ "$DDL_USER" != "$MYSQL_WRITE_USERNAME" ]; then
+        sed -e "s/__APP_USER__/$MYSQL_WRITE_USERNAME/g" -e "s/__APP_HOST__/$APP_DB_HOST/g" sql/grants/app.sql \
+          | mysql -h "$MYSQL_WRITE_HOST" -P "$MYSQL_WRITE_PORT" -u "$DDL_USER" -p"$DDL_PASS" \
+          && echo 'App grants applied (sql/grants/app.sql).' \
+          || echo 'WARNING: App grants NOT applied -- the DDL account lacks GRANT OPTION. Grant it, or run sql/grants/app.sql by hand as a DB admin.'
+      else
+        echo 'App grants skipped: no dedicated DDL account, so the app user cannot grant to itself.'
+      fi
+      EOS
+      )"
+
+      # The container is named, not --rm, so a destructive-migration backup (mariadb-dump
+      # of the affected tables, written inside it) survives long enough to be copied to
+      # the runner host (mode 0700; it holds table data, treat it as sensitive).
+      MIGRATE_CONTAINER="$CI_PROJECT_NAME-migrate-$CI_JOB_ID"
+      BACKUP_HOST_DIR="$HOME/ubix-migration-backups/$CI_PROJECT_NAME"
+      docker rm -f "$MIGRATE_CONTAINER" >/dev/null 2>&1 || true
+      docker run --name "$MIGRATE_CONTAINER" --workdir /web \
+        -e UBIX_MIGRATION_BACKUP_DIR=/tmp/ubix-migration-backups \
+        -e UBIX_TIER -e UBIX_MIGRATE_MODE -e MIGRATE_ACK -e APP_DB_HOST -e GITLAB_USER_LOGIN \
+        -e MYSQL_WRITE_HOST -e MYSQL_WRITE_PORT -e MYSQL_WRITE_DATABASE -e MYSQL_WRITE_USERNAME -e MYSQL_WRITE_PASSWORD \
+        -e MYSQL_MIGRATION_USERNAME -e MYSQL_MIGRATION_PASSWORD -e DDL_USER -e DDL_PASS \
+        -e MYSQL_READ_HOST="$MYSQL_WRITE_HOST" -e MYSQL_READ_PORT="$MYSQL_WRITE_PORT" -e MYSQL_READ_DATABASE="$MYSQL_WRITE_DATABASE" \
+        -e MYSQL_READ_USERNAME="$MYSQL_WRITE_USERNAME" -e MYSQL_READ_PASSWORD="$MYSQL_WRITE_PASSWORD" \
+        "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA-test" \
+        sh -c "$INNER" 2>&1 | tee migrate.log
+      RC=${PIPESTATUS[0]}
+      if [ "$UBIX_MIGRATE_MODE" = verify ]; then
+        docker rm -f "$MIGRATE_CONTAINER" >/dev/null 2>&1 || true
+        exit "$RC"
+      fi
+      # A run with nothing destructive leaves no backup directory, so the copy may miss.
+      umask 077; mkdir -p "$BACKUP_HOST_DIR"; chmod 700 "$HOME/ubix-migration-backups" "$BACKUP_HOST_DIR"
+      if docker cp "$MIGRATE_CONTAINER:/tmp/ubix-migration-backups/." "$BACKUP_HOST_DIR/" 2>/dev/null; then
+        echo "Destructive-migration backups kept on $(hostname):$BACKUP_HOST_DIR"; ls -lR "$BACKUP_HOST_DIR" | tail -5
+      fi
+      docker rm -f "$MIGRATE_CONTAINER" >/dev/null 2>&1 || true
+      SUMMARY="$(grep -v '^Migration target overrides\|^  ENV\|^  MYSQL' migrate.log | sed '/^[[:space:]]*$/d' | tail -20)"
+      if [ "$RC" -eq 0 ]; then COLOR=3066993; TITLE="🗄️ Migrations applied — $T"
+      elif grep -q '^HELD:' migrate.log; then COLOR=15105570; TITLE="🗄️ Migrations HELD (destructive) — $T"
+      else COLOR=15158332; TITLE="🗄️ Migrations FAILED — $T"; fi
+      discord ops "$COLOR" "$TITLE" "Ref: ${CI_COMMIT_REF_NAME} · [${CI_COMMIT_SHORT_SHA}](${CI_PROJECT_URL}/-/commit/${CI_COMMIT_SHA}) · [job](${CI_JOB_URL})
+      \`\`\`
+      ${SUMMARY}
+      \`\`\`"
+      exit "$RC"
+
+# Test jobs that apply waits for (js/go only exist when the repo has such apps).
+migrate-verify-dev:
+  extends: [.ubix_migrate, .ubix_on_dev]
+  variables: { UBIX_MIGRATE_MODE: verify }
+  needs: [build-dev]
+  rules: [{ if: *if_migrate_dev }]
+migrate-verify-staging:
+  extends: [.ubix_migrate, .ubix_on_staging]
+  variables: { UBIX_MIGRATE_MODE: verify }
+  needs: [build-staging]
+  rules: [{ if: *if_migrate_staging }]
+migrate-verify-prod:
+  extends: [.ubix_migrate, .ubix_on_prod]
+  variables: { UBIX_MIGRATE_MODE: verify }
+  needs: [build-prod]
+  rules: [{ if: *if_migrate_prod }]
+
+migrate-apply-dev:
+  extends: [.ubix_migrate, .ubix_on_dev]
+  needs:
+    - build-dev
+    - { job: migrate-verify-dev, optional: true }
+    - { job: static-checks-dev, optional: true }
+    - { job: phpunit-dev, optional: true }
+    - { job: js-lint-dev, optional: true }
+    - { job: go-checks-dev, optional: true }
+  rules: [{ if: *if_migrate_dev, when: on_success }]
+migrate-apply-staging:
+  extends: [.ubix_migrate, .ubix_on_staging]
+  needs:
+    - build-staging
+    - { job: migrate-verify-staging, optional: true }
+    - { job: static-checks-staging, optional: true }
+    - { job: phpunit-staging, optional: true }
+    - { job: js-lint-staging, optional: true }
+    - { job: go-checks-staging, optional: true }
+  rules: [{ if: *if_migrate_staging, when: on_success }]
+migrate-apply-prod:
+  extends: [.ubix_migrate, .ubix_on_prod]
+  needs:
+    - build-prod
+    - { job: migrate-verify-prod, optional: true }
+    - { job: static-checks-prod, optional: true }
+    - { job: phpunit-prod, optional: true }
+    - { job: js-lint-prod, optional: true }
+    - { job: go-checks-prod, optional: true }
+  # Manual and blocking: deploy-prod waits for it.
+  rules: [{ if: *if_migrate_prod, when: manual, allow_failure: false }]
+
+migrate-apply-staging-destructive:
+  extends: [.ubix_migrate, .ubix_on_staging]
+  variables: { MIGRATE_ACK: --i-acknowledge-destructive }
+  needs: [build-staging]
+  rules: [{ if: *if_migrate_staging, when: manual, allow_failure: true }]
+migrate-apply-prod-destructive:
+  extends: [.ubix_migrate, .ubix_on_prod]
+  variables: { MIGRATE_ACK: --i-acknowledge-destructive }
+  needs: [build-prod]
+  rules: [{ if: *if_migrate_prod, when: manual, allow_failure: true }]
+
+# Optional drift gate (UBIX_DRIFT_ENABLED=true): replay every migration into REPLAY_
+# schemas on the unit-test server, then diff against the live tier. `extraInLive` is
+# drift (something no migration created); `missingFromLive` is a tier that is behind.
+# Both REPLAY_SYSTEMS and REPLAY_<tier database> are dropped first, so the replay starts
+# from nothing and the gate is repeatable. A host with further databases extends the
+# drop list by overriding UBIX_DRIFT_EXTRA_DBS (space-separated, unprefixed names).
+.ubix_drift:
+  extends: .ubix_registry_login
+  stage: migrate
+  tags: [$UBIX_BUILD_TAG]
+  interruptible: false
+  timeout: 20 minutes
+  allow_failure: false
+  variables:
+    UBIX_DRIFT_EXTRA_DBS: ""
+  script:
+    - |
+      set -u; SCRIPT_DIR="$CI_PROJECT_DIR"; . "$UBIX_NOTIFY_SCRIPT"; export VAULT_KV_PREFIX="$UBIX_VAULT_PREFIX"
+      T="$UBIX_TIER"
+      export MYSQL_WRITE_HOST="$(vault_kv db-$T host)" MYSQL_WRITE_PORT="$(vault_kv db-$T port)"
+      export MYSQL_WRITE_DATABASE="$(vault_kv db-$T database)"
+      export MYSQL_WRITE_USERNAME="$(vault_kv db-$T write_username)" MYSQL_WRITE_PASSWORD="$(vault_kv db-$T write_password)"
+      export MYSQL_MIGRATION_USERNAME="$(vault_kv db-$T migration_username)" MYSQL_MIGRATION_PASSWORD="$(vault_kv db-$T migration_password)"
+      [ -n "$MYSQL_WRITE_HOST" ] || { echo "no db-$T credentials from vault (secret/$UBIX_VAULT_PREFIX/db-$T)"; exit 1; }
+      # The scratch rebuild lives on the unit-test server, never a tier.
+      export TEST_MYSQL_WRITE_HOST="$(vault_kv test-db host)" TEST_MYSQL_WRITE_PORT="$(vault_kv test-db port)"
+      export TEST_MYSQL_WRITE_USERNAME="$(vault_kv test-db username)" TEST_MYSQL_WRITE_PASSWORD="$(vault_kv test-db password)"
+      [ -n "$TEST_MYSQL_WRITE_HOST" ] || { echo "no test-db credentials from vault (secret/$UBIX_VAULT_PREFIX/test-db)"; exit 1; }
+      DROPS="DROP DATABASE IF EXISTS REPLAY_SYSTEMS; DROP DATABASE IF EXISTS REPLAY_${MYSQL_WRITE_DATABASE}"
+      for DB in $UBIX_DRIFT_EXTRA_DBS; do DROPS="$DROPS; DROP DATABASE IF EXISTS REPLAY_${DB}"; done
+      export DROPS UBIX_TIER
+      INNER="$(cat <<'EOS'
+      set -e
+      mysql -h "$TEST_MYSQL_WRITE_HOST" -P "$TEST_MYSQL_WRITE_PORT" -u "$TEST_MYSQL_WRITE_USERNAME" -p"$TEST_MYSQL_WRITE_PASSWORD" -e "$DROPS"
+      php bin/ubix database:resetSchema "$UBIX_TIER" --prefix=REPLAY_
+      mysql -h "$TEST_MYSQL_WRITE_HOST" -P "$TEST_MYSQL_WRITE_PORT" -u "$TEST_MYSQL_WRITE_USERNAME" -p"$TEST_MYSQL_WRITE_PASSWORD" -e 'DROP DATABASE IF EXISTS REPLAY_SYSTEMS; CREATE DATABASE REPLAY_SYSTEMS'
+      php bin/ubix migrate:up --target=test --prefix=REPLAY_ --yes -n
+      php bin/ubix migrate:diff --target="$UBIX_TIER" --mode=replay --replay-prefix=REPLAY_
+      EOS
+      )"
+      DRIFT_CONTAINER="$CI_PROJECT_NAME-drift-$CI_JOB_ID"
+      docker rm -f "$DRIFT_CONTAINER" >/dev/null 2>&1 || true
+      docker run --name "$DRIFT_CONTAINER" --workdir /web \
+        -e DROPS -e UBIX_TIER \
+        -e MYSQL_WRITE_HOST -e MYSQL_WRITE_PORT -e MYSQL_WRITE_DATABASE -e MYSQL_WRITE_USERNAME -e MYSQL_WRITE_PASSWORD \
+        -e MYSQL_MIGRATION_USERNAME -e MYSQL_MIGRATION_PASSWORD \
+        -e TEST_MYSQL_WRITE_HOST -e TEST_MYSQL_WRITE_PORT -e TEST_MYSQL_WRITE_USERNAME -e TEST_MYSQL_WRITE_PASSWORD \
+        "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA-test" \
+        sh -c "$INNER" 2>&1 | tee drift.log
+      RC=${PIPESTATUS[0]}
+      docker rm -f "$DRIFT_CONTAINER" >/dev/null 2>&1 || true
+      if [ "$RC" -ne 0 ]; then
+        echo "SCHEMA DRIFT or comparison error on $T -- see the diff above."
+        echo "  + lines are drift: in the live schema and created by no migration."
+        echo "  - lines are migrations this tier has not applied yet, which is not drift."
+      fi
+      exit $RC
+  artifacts:
+    when: always
+    paths: [drift.log]
+    expire_in: 30 days
+
+drift-dev:     { extends: [.ubix_drift, .ubix_on_dev],     needs: [migrate-apply-dev],     rules: [{ if: *if_drift_dev }] }
+drift-staging: { extends: [.ubix_drift, .ubix_on_staging], needs: [migrate-apply-staging], rules: [{ if: *if_drift_staging }] }
+drift-prod:    { extends: [.ubix_drift, .ubix_on_prod],    needs: [migrate-apply-prod],    rules: [{ if: *if_drift_prod }] }
+
+# ---------------------------------------------------------------------------
+# deploy — `bash bin/deploy.sh <ref-slug>` (posts its own result note).
+# needs: the build, the tier's migrate jobs and the test jobs, so a held destructive
+# migration or a red gate stops the deploy. Migrate and the js/go jobs are optional
+# needs: they are absent when UBIX_MIGRATE_ENABLED=false or the repo has no such app.
+# Prod is manual by default (UBIX_PROD_DEPLOY_WHEN=on_success for auto) and always
+# deploys into the protected `production` environment.
+# ---------------------------------------------------------------------------
+.ubix_deploy:
+  stage: deploy
+  tags: [$UBIX_DEPLOY_TAG]
+  interruptible: false
+  script:
+    - bash "$UBIX_DEPLOY_SCRIPT" "$CI_COMMIT_REF_SLUG"
+
+deploy-dev:
+  extends: [.ubix_deploy, .ubix_on_dev]
+  environment: { name: dev }
+  needs:
+    - build-dev
+    - { job: migrate-verify-dev, optional: true }
+    - { job: migrate-apply-dev, optional: true }
+    - static-checks-dev
+    - phpunit-dev
+    - { job: js-lint-dev, optional: true }
+    - { job: go-checks-dev, optional: true }
+deploy-staging:
+  extends: [.ubix_deploy, .ubix_on_staging]
+  environment: { name: staging }
+  needs:
+    - build-staging
+    - { job: migrate-verify-staging, optional: true }
+    - { job: migrate-apply-staging, optional: true }
+    - static-checks-staging
+    - phpunit-staging
+    - { job: js-lint-staging, optional: true }
+    - { job: go-checks-staging, optional: true }
+deploy-prod:
+  extends: [.ubix_deploy, .ubix_on_prod]
+  environment: { name: production }
+  needs:
+    - build-prod
+    - { job: migrate-verify-prod, optional: true }
+    - { job: migrate-apply-prod, optional: true }
+    - static-checks-prod
+    - phpunit-prod
+    - { job: js-lint-prod, optional: true }
+    - { job: go-checks-prod, optional: true }
+  rules:
+    - if: *if_prod_auto
+      when: on_success
+    - if: *if_prod
+      when: manual
+      allow_failure: false
+
+# ---------------------------------------------------------------------------
+# promote — dev → staging → prod by fast-forward (`bash bin/promote.sh <branch>`),
+# automatic after a green deploy. promote.sh halts on a Destructive: migration; the
+# *-destructive manual job sets PROMOTE_ACK_DESTRUCTIVE=1 and proceeds. Needs the
+# GITLAB_PROMOTE_TOKEN CI variable. A host with no staging tier defines its own promote.
+# ---------------------------------------------------------------------------
+.ubix_promote:
+  stage: promote
+  tags: [$UBIX_DEPLOY_TAG]
+  interruptible: false
+  variables: { GIT_DEPTH: "0" }
+
+promote-to-staging:
+  extends: .ubix_promote
+  needs: [{ job: deploy-dev, artifacts: false }]
+  rules: [{ if: *if_dev, when: on_success, allow_failure: true }]
+  script: [bash "$UBIX_PROMOTE_SCRIPT" "$UBIX_STAGING_BRANCH"]
+promote-to-staging-destructive:
+  extends: .ubix_promote
+  needs: [{ job: deploy-dev, artifacts: false }]
+  rules: [{ if: *if_dev, when: manual, allow_failure: true }]
+  variables: { GIT_DEPTH: "0", PROMOTE_ACK_DESTRUCTIVE: "1" }
+  script: [bash "$UBIX_PROMOTE_SCRIPT" "$UBIX_STAGING_BRANCH"]
+promote-to-prod:
+  extends: .ubix_promote
+  needs: [{ job: deploy-staging, artifacts: false }]
+  rules: [{ if: *if_staging, when: on_success, allow_failure: true }]
+  script: [bash "$UBIX_PROMOTE_SCRIPT" "$UBIX_PROD_BRANCH"]
+promote-to-prod-destructive:
+  extends: .ubix_promote
+  needs: [{ job: deploy-staging, artifacts: false }]
+  rules: [{ if: *if_staging, when: manual, allow_failure: true }]
+  variables: { GIT_DEPTH: "0", PROMOTE_ACK_DESTRUCTIVE: "1" }
+  script: [bash "$UBIX_PROMOTE_SCRIPT" "$UBIX_PROD_BRANCH"]
+
+# ---------------------------------------------------------------------------
+# notify — a red pipeline posts to #<project>-alerts via the host's notify helper
+# ---------------------------------------------------------------------------
+.ubix_notify_failure:
+  stage: notify
+  tags: [$UBIX_DEPLOY_TAG]
+  interruptible: false
+  timeout: 5 minutes
+  script:
+    - |
+      set -u
+      SCRIPT_DIR="$CI_PROJECT_DIR"; . "$UBIX_NOTIFY_SCRIPT"; export VAULT_KV_PREFIX="$UBIX_VAULT_PREFIX"
+      WHO="${GITLAB_USER_NAME:-${GITLAB_USER_LOGIN:-unknown}}"
+      TEXT="Branch: ${CI_COMMIT_REF_NAME} — pushed by ${WHO}
+      Commit: [${CI_COMMIT_TITLE:-$CI_COMMIT_SHORT_SHA}](${CI_PROJECT_URL}/-/commit/${CI_COMMIT_SHA}) (${CI_COMMIT_SHORT_SHA})
+      Author: ${CI_COMMIT_AUTHOR:-unknown}
+      Pipeline: ${CI_PIPELINE_URL}"
+      discord alerts 15158332 "🔴 Pipeline FAILED" "$TEXT"
+      exit 0
+
+notify-failure-dev:     { extends: .ubix_notify_failure, rules: [{ if: *if_dev, when: on_failure }] }
+notify-failure-staging: { extends: .ubix_notify_failure, rules: [{ if: *if_staging, when: on_failure }] }
+notify-failure-prod:    { extends: .ubix_notify_failure, rules: [{ if: *if_prod, when: on_failure }] }
+
+# ---------------------------------------------------------------------------
+# approval — every merge needs the owner's Approve or 👍 (bin/ubix ci:requireApproval;
+# docs/standards/branching-and-git-workflow.md § Merge sign-off). Fails until signed
+# off; with "Pipelines must succeed" on, that blocks the merge. GitLab does not re-run
+# a pipeline on approval: approve, then retry this job. Its own late stage, so a red
+# verdict neither hides nor holds up the real checks. Token: APPROVAL_GITLAB_TOKEN or
+# AI_REVIEW_GITLAB_TOKEN (Reporter, api, masked, not protected). Agents never approve.
+# ---------------------------------------------------------------------------
+require-approval-mr:
+  extends: [.ubix_registry_login, .ubix_on_mr]
+  stage: approval
+  tags: [$UBIX_BUILD_TAG]
+  needs: [build-mr]
+  timeout: 5 minutes
+  script:
+    - |
+      [ -n "$UBIX_APPROVAL_OWNERS" ] || { echo "require-approval-mr: set UBIX_APPROVAL_OWNERS to the usernames whose Approve/👍 counts"; exit 1; }
+      docker run --rm --workdir /web \
+        -e APPROVAL_GITLAB_TOKEN -e AI_REVIEW_GITLAB_TOKEN -e MERGE_APPROVAL_OWNERS="$UBIX_APPROVAL_OWNERS" \
+        -e CI_API_V4_URL -e CI_PROJECT_ID -e CI_COMMIT_BRANCH -e CI_MERGE_REQUEST_IID \
+        "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA-test" \
+        php bin/ubix ci:requireApproval
+
+# ---------------------------------------------------------------------------
+# maintenance — scheduled `cron:<task>` against a tier. This is the base only: a host
+# defines the concrete task job, e.g.
+#
+#   purge-pii-audits:
+#     extends: .ubix_maintenance
+#     rules: [{ if: '$CI_PIPELINE_SOURCE == "schedule" && $MAINTENANCE_TASK == "purge-pii-audits"' }]
+#
+# The schedule carries MAINTENANCE_TASK (and optionally MAINTENANCE_TIER, default dev).
+# Runs the image the tier is deployed from (`:<slug>`), not a fresh build, and uses the
+# DDL account (the app user cannot delete from an audit trail).
+# ---------------------------------------------------------------------------
+.ubix_maintenance:
+  extends: .ubix_registry_login
+  stage: maintenance
+  tags: [$UBIX_BUILD_TAG]
+  interruptible: false
+  timeout: 30 minutes
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule" && $MAINTENANCE_TASK'
+  script:
+    - |
+      set -euo pipefail
+      SCRIPT_DIR="$CI_PROJECT_DIR"; . "$UBIX_NOTIFY_SCRIPT"; export VAULT_KV_PREFIX="$UBIX_VAULT_PREFIX"
+      TIER="${MAINTENANCE_TIER:-dev}"
+      export MYSQL_WRITE_HOST="$(vault_kv db-$TIER host)" MYSQL_WRITE_PORT="$(vault_kv db-$TIER port)"
+      export MYSQL_WRITE_DATABASE="$(vault_kv db-$TIER database)"
+      export MYSQL_WRITE_USERNAME="$(vault_kv db-$TIER migration_username)" MYSQL_WRITE_PASSWORD="$(vault_kv db-$TIER migration_password)"
+      [ -n "$MYSQL_WRITE_USERNAME" ] || { echo "no DDL account for $TIER (secret/$UBIX_VAULT_PREFIX/db-$TIER migration_username)"; exit 1; }
+      docker run --rm --pull always --workdir /web \
+        -e MYSQL_WRITE_HOST -e MYSQL_WRITE_PORT -e MYSQL_WRITE_DATABASE -e MYSQL_WRITE_USERNAME -e MYSQL_WRITE_PASSWORD \
+        -e MYSQL_READ_HOST="$MYSQL_WRITE_HOST" -e MYSQL_READ_PORT="$MYSQL_WRITE_PORT" -e MYSQL_READ_DATABASE="$MYSQL_WRITE_DATABASE" \
+        -e MYSQL_READ_USERNAME="$MYSQL_WRITE_USERNAME" -e MYSQL_READ_PASSWORD="$MYSQL_WRITE_PASSWORD" \
+        "$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG" \
+        php bin/ubix "cron:$MAINTENANCE_TASK" 2>&1 | tee maintenance.log
+      discord ops 3066993 "🧹 Maintenance: $MAINTENANCE_TASK — $TIER" "Ref: ${CI_COMMIT_REF_NAME} · [job](${CI_JOB_URL})
+      \`\`\`
+      $(tail -5 maintenance.log)
+      \`\`\`"

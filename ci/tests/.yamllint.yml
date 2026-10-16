@@ -1,0 +1,11 @@
+extends: default
+rules:
+  line-length: disable          # shell scripts embedded in block scalars
+  document-start: disable
+  truthy: { check-keys: false }
+  comments: { min-spaces-from-content: 1 }
+  comments-indentation: disable
+  braces: { max-spaces-inside: 1 }
+  brackets: { max-spaces-inside: 1 }
+  colons: { max-spaces-after: -1 }
+  commas: { max-spaces-after: -1 }
