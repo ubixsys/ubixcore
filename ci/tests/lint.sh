@@ -4,8 +4,8 @@
 #   2. glab ci lint on the template itself (a valid standalone config)
 #   3. rules.py: dry-runs the template per tier/variable scenario and checks the job set
 #   4. glab ci lint on the example consumer, which includes the template by `local:`.
-#      GitLab resolves `local:` against the pushed ref, so this runs only when the
-#      current branch exists on origin (push first).
+#      Runs only when the current branch exists on origin (push first); the include is
+#      rewritten to that branch's copy of the template.
 # Steps 2-4 need glab, authenticated against the instance; they are skipped with
 # --offline or when glab is absent.
 set -euo pipefail
@@ -21,7 +21,13 @@ python3 -I ci/tests/rules.py
 
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
-  glab ci lint --ref "$BRANCH" ci/tests/consumer.gitlab-ci.yml
+  # The linter resolves `local:` against the default branch, so lint the consumer with the
+  # include rewritten to this branch's pushed copy of the template.
+  TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+  PROJECT="$(git remote get-url origin | sed -E 's#^.*[:/]([^/]+/[^/]+)\.git$#\1#')"
+  sed -e "s#- local: ci/ubixcore-pipeline.yml#- { project: $PROJECT, ref: $BRANCH, file: ci/ubixcore-pipeline.yml }#" \
+    ci/tests/consumer.gitlab-ci.yml > "$TMP/consumer.yml"
+  glab ci lint "$TMP/consumer.yml"
 else
   echo "branch $BRANCH is not on origin: skipping the consumer lint (push first)"
 fi
