@@ -1,0 +1,33 @@
+# Example consumer of ci/ubixcore-pipeline.yml, and the fixture ci/tests/lint.sh lints.
+# A real host includes the template by project + release tag instead of `local:`:
+#
+#   include:
+#     - project: ubixsys/ubixcore
+#       ref: v0.46.0
+#       file: ci/ubixcore-pipeline.yml
+include:
+  - local: ci/ubixcore-pipeline.yml
+
+variables:
+  UBIX_PROD_DEPLOY_WHEN: on_success      # change a variable
+  UBIX_TIERS: "dev,staging,prod"
+  UBIX_APPROVAL_OWNERS: cwolsen
+  UBIX_DRIFT_ENABLED: "true"
+
+# Replace a job's script (keys merge; script replaces).
+phpunit-dev:
+  variables: { EXAMPLE_FLAG: "1" }
+
+# Drop a job.
+ai-review-mr:
+  rules: [{ when: never }]
+
+# Add a job from a hidden base.
+extra-static-checks:
+  extends: [.ubix_static_checks, .ubix_on_dev]
+  needs: [build-dev]
+
+# A concrete maintenance task on the hidden base.
+purge-example:
+  extends: .ubix_maintenance
+  rules: [{ if: '$CI_PIPELINE_SOURCE == "schedule" && $MAINTENANCE_TASK == "purge-example"' }]

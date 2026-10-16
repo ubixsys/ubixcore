@@ -1,6 +1,8 @@
 # Design: one standard GitLab CI pipeline template for uBixCore apps
 
-Status: proposal. Lane `docs/ci-pipeline-template`. Source pipelines read on 2026-10-15:
+Status: accepted; implemented in `ci/ubixcore-pipeline.yml` (lane `ci/pipeline-template`, item 103).
+Where the implementation differs from the original proposal, this document now describes the
+implementation. Original lane `docs/ci-pipeline-template`. Source pipelines read on 2026-10-15:
 kitg `.gitlab-ci.yml` (836 lines), project-neptune `.gitlab-ci.yml` (5355 lines), this
 repo's `.gitlab-ci.yml` (222 lines) and `skeleton/.gitlab-ci.yml` (325 lines). Neither
 kitg nor neptune uses `include:`; every host today carries a full copy.
@@ -104,8 +106,8 @@ fast-forward promote scripts, destructive-migration acknowledgement, and deploy 
 
 ### 3.1 Delivery
 
-A single file in the framework repo, `ci/ubixcore-pipeline.yml` (plus `ci/extensions/*.yml`
-for opt-in jobs), consumed by hosts with:
+A single file in the framework repo, `ci/ubixcore-pipeline.yml` (`ci/extensions/*.yml` for
+opt-in jobs is deferred, see §3.8), consumed by hosts with:
 
 ```yaml
 include:
@@ -128,9 +130,15 @@ build → test → migrate → deploy → promote → notify
 ```
 
 plus optional `approval` (MR sign-off) and `maintenance` (scheduled `cron:*` tasks).
-`lint-and-test` is renamed `test`; hosts that still use the old name keep working by
-overriding `stages:` (§3.5). Needs are explicit: `test`/`migrate` jobs `needs: build-<tier>`;
-`deploy-<tier>` `needs:` build, migrate-verify and test jobs; prod adds `migrate-apply-prod`.
+The shipped order is `build, test, migrate, deploy, promote, notify, approval, maintenance`:
+`approval` comes after `notify` so `notify-failure-*` does not page for every push that is
+merely not yet approved. `lint-and-test` is renamed `test`; hosts that still use the old name
+keep working by overriding `stages:` (§3.5). Needs are explicit: `test` and `migrate-verify`
+jobs `needs: build-<tier>`; `migrate-apply-<tier>` also needs the tier's static-checks,
+phpunit and (when present) js/go jobs, so no schema changes under red code; `deploy-<tier>`
+`needs:` build, `migrate-verify`, `migrate-apply` (all optional, absent with
+`UBIX_MIGRATE_ENABLED=false`) and the test jobs. Every tier, not only prod, waits for its
+`migrate-apply`, so a held destructive migration stops the deploy.
 
 ### 3.3 Jobs shipped in the core
 
@@ -140,22 +148,26 @@ overriding `stages:` (§3.5). Needs are explicit: `test`/`migrate` jobs `needs: 
 | `build-{dev,staging,prod}` | build | branch = tier branch | runtime + `-test` image; node/go images per `app/*Js` / `app/*Go` |
 | `build-mr` | build | MR | amd64 only |
 | `static-checks-*` | test | tier branch, MR | phpcs + phpstan |
-| `phpunit-*` | test | tier branch, MR | uses vault `test-db`; schema reset |
-| `js-lint-*`, `go-checks-*` | test | tier branch, MR | run only if matching app dirs exist |
-| `migrate-verify-*` | migrate | tier branch | read-only; host cross-check; prod gates deploy |
-| `migrate-apply-{dev,staging}` | migrate | tier branch | holds on destructive |
-| `migrate-apply-prod` | migrate | prod branch, manual | |
-| `migrate-apply-*-destructive` | migrate | manual | ack flag |
-| `drift-*` | migrate | after apply | optional (`UBIX_DRIFT_ENABLED`) |
-| `deploy-{dev,staging,prod}` | deploy | tier branch | `bash bin/deploy.sh $CI_COMMIT_REF_SLUG`; `environment:`; prod `when: $UBIX_PROD_DEPLOY_WHEN` |
-| `promote-to-staging`, `promote-to-prod` (+ `-destructive`) | promote | dev / staging | `bash bin/promote.sh <target>` |
+| `phpunit-*` | test | tier branch, MR | tier jobs use vault `test-db` and reset the schema; `phpunit-mr` runs the suite only (the vault token is a protected variable, absent on feature branches) |
+| `js-lint-*`, `go-checks-*` | test | tier branch, MR | exist only if `app/*Js/package.json` / `app/*Go/go.mod` exist (`rules:exists`) |
+| `migrate-verify-*` | migrate | tier branch | read-only `migrate:status --verify`; host cross-check first; gates deploy |
+| `migrate-apply-{dev,staging}` | migrate | tier branch | `migrate:up` without ack; on staging/prod a pending destructive migration **holds** (job fails with a `HELD:` banner and an orange #ops post); dev applies destructive migrations |
+| `migrate-apply-prod` | migrate | prod branch, manual, blocking | `deploy-prod` waits for it |
+| `migrate-apply-{staging,prod}-destructive` | migrate | manual, `allow_failure` | ack flag; afterwards retry `migrate-apply-<tier>` to unblock the deploy. No dev variant: dev never holds |
+| `drift-*` | migrate | after apply | optional (`UBIX_DRIFT_ENABLED`); drops `REPLAY_SYSTEMS` and `REPLAY_<tier database>` (more via the job variable `UBIX_DRIFT_EXTRA_DBS`) |
+| `deploy-{dev,staging,prod}` | deploy | tier branch | `bash bin/deploy.sh $CI_COMMIT_REF_SLUG`; environments `dev`, `staging`, `production`; prod is `manual` unless `UBIX_PROD_DEPLOY_WHEN=on_success` (expressed as two `rules:` entries, since `when:` cannot take a variable) |
+| `promote-to-staging`, `promote-to-prod` (+ `-destructive`) | promote | dev / staging | `bash bin/promote.sh <branch>`, the target being `UBIX_STAGING_BRANCH` / `UBIX_PROD_BRANCH`; a host with no staging tier defines its own promote |
 | `require-approval-mr` | approval | MR | `php bin/ubix ci:requireApproval` |
 | `ai-review-mr` | test | MR, allow_failure | skips cleanly without keys |
 | `notify-failure-*` | notify | `on_failure` | `bin/lib/notify.sh` |
-| `purge-*` / `maintenance` | maintenance | schedule + `MAINTENANCE_TASK` | hidden base `.ubix_maintenance`; host defines concrete tasks |
+| `.ubix_maintenance` | maintenance | schedule + `MAINTENANCE_TASK` | hidden base only; the host defines concrete tasks (`purge-*`), see `ci/tests/consumer.gitlab-ci.yml` |
 
-All hidden bases (`.ubix_build`, `.ubix_phpunit`, `.ubix_migrate`, `.ubix_deploy`,
-`.ubix_promote`, …) are public API: a host `extends:` them to add its own jobs.
+All hidden bases (`.ubix_build`, `.ubix_static_checks`, `.ubix_phpunit`, `.ubix_js_lint`,
+`.ubix_go_checks`, `.ubix_migrate`, `.ubix_drift`, `.ubix_deploy`, `.ubix_promote`,
+`.ubix_notify_failure`, `.ubix_maintenance`, …) and the tier selectors `.ubix_on_dev`,
+`.ubix_on_staging`, `.ubix_on_prod`, `.ubix_on_mr` (rules plus the `UBIX_TIER` variables the
+scripts read) are public API: a host `extends:` them to add its own jobs, e.g.
+`extends: [.ubix_static_checks, .ubix_on_dev]`.
 
 ### 3.4 Overridable variables
 
@@ -170,13 +182,17 @@ Declared under `variables:` in the template with defaults; hosts set them in the
 | `UBIX_TIERS` | `dev,staging,prod` | tiers that get jobs (a host may drop staging) |
 | `UBIX_RUNTIME_DOCKERFILE_DEV/STAGING/PROD` | `Dockerfile` / `Dockerfile_Staging` / `Dockerfile_Main` | per-tier Dockerfile |
 | `UBIX_TEST_DOCKERFILE` | `Dockerfile_Test` | test image |
+| `UBIX_NODE_DOCKERFILE` / `UBIX_GO_DOCKERFILE` | `Dockerfile_Node` / `Dockerfile_Go` | per-app images, parameterised by `APP_DIR` (added by the implementation) |
+| `UBIX_PHPSTAN_PATHS` | `app bin php public tests` | paths phpstan analyses (added) |
+| `UBIX_JS_TEST_SKIP` | empty | `app/*Js` names whose `npm test` cannot run in the plain node image (added) |
+| `UBIX_AI_REVIEW_GUIDE` | `bin/ci/ai-review-guide.md` | host rules for `ci:aiReview`; ignored if absent (added) |
 | `UBIX_BUILD_PLATFORMS` | `linux/amd64,linux/arm64` | buildx platforms (MR build forced to amd64) |
 | `UBIX_CACHE_IMAGE` | empty | registry cache target; empty = none |
-| `UBIX_VAULT_PREFIX` | `$CI_PROJECT_NAME` | `secret/<prefix>/…` paths for `db-<tier>`, `test-db`, `composer` |
+| `UBIX_VAULT_PREFIX` | `$CI_PROJECT_NAME` | `secret/<prefix>/…` paths for `db-<tier>`, `test-db`, `composer`; exported to the host's `vault_kv` as `VAULT_KV_PREFIX` |
 | `UBIX_MIGRATE_ENABLED` | `true` | `false` removes migrate jobs (no DB) |
 | `UBIX_DRIFT_ENABLED` | `false` | drift replay |
 | `UBIX_PROD_DEPLOY_WHEN` | `manual` | `manual` or `on_success` |
-| `UBIX_APP_DB_HOST` | `%` (dev), `10.50.%` (staging/prod) | grants host pattern; set per host |
+| `UBIX_APP_DB_HOST` | empty = `%` on dev, `10.50.%` on staging/prod | grants host pattern; one value for every tier when set |
 | `UBIX_APPROVAL_OWNERS` | empty (required if approval used) | usernames whose Approve/👍 counts |
 | `UBIX_NOTIFY_SCRIPT` | `bin/lib/notify.sh` | notification helper |
 | `UBIX_DEPLOY_SCRIPT` / `UBIX_PROMOTE_SCRIPT` | `bin/deploy.sh` / `bin/promote.sh` | entry points |
@@ -188,6 +204,9 @@ Declared under `variables:` in the template with defaults; hosts set them in the
   keys (`script:` replaces, `variables:` merges).
 - **Add a job:** `extends: .ubix_phpunit` etc.
 - **Drop a job:** redefine it with `rules: [{ when: never }]`.
+- **Change when a job runs:** `rules:` replaces the template's rules wholesale; copy the
+  conditions you still want from the `.ubix_if` block at the top of the template (YAML anchors
+  do not cross `include:`, so they must be copied as text).
 - **Reorder stages:** a host that needs an extra stage redeclares `stages:` in full
   (stage lists do not merge).
 
@@ -213,7 +232,8 @@ merge button on staging.
 
 ### 3.8 Extensions (opt-in, not core)
 
-`ci/extensions/` ships separately includable files, each with its own variables: Lighthouse,
+**Not in the first release** (`ci/extensions/` is not shipped yet; it graduates host gates once a
+second host wants them). The intended shape: separately includable files, each with its own variables: Lighthouse,
 DAST, gitleaks, cspell/knip, MR-size and owned-paths notices, emergency deploy and rollback,
 smoke test. Neptune's own gates stay in neptune until two hosts want them.
 
@@ -241,8 +261,12 @@ smoke test. Neptune's own gates stay in neptune until two hosts want them.
 - **Prod migrate/deploy ordering:** kitg makes the prod migrate manual and deploy automatic;
   neptune the opposite. The template defaults to neptune's (verify gates, deploy manual);
   kitg overrides `UBIX_PROD_DEPLOY_WHEN=on_success`.
-- **Template testing.** No way to run `ci/` locally against a real host; propose a
-  `ci/tests` lint (`glab ci lint`) job in the framework pipeline.
+- **Template testing.** Implemented as `ci/tests/lint.sh`: yamllint, `glab ci lint` on the
+  template and on an example consumer, and `ci/tests/rules.py`, which dry-runs the template
+  through GitLab's lint API per tier/variable scenario and checks the job set and `when:`.
+  Still open: running it from the framework's own `.gitlab-ci.yml` (that file is outside the
+  implementing lane's scope), and exercising the scripts against a real host (kitg is the
+  parity candidate, §4).
 - **Coverage.** This analysis read the two named repos only; ubixshepherd, ubixvault and
   ubixkelpie pipelines were not reviewed.
 
@@ -251,8 +275,9 @@ smoke test. Neptune's own gates stay in neptune until two hosts want them.
 Each step is one merge request's worth, in order. Step 0 is a prerequisite and **outside
 this lane's scope** (it touches `ci/`), so it needs its own lane.
 
-0. **Implement the template** — `ubixsys/ubixcore`: add `ci/ubixcore-pipeline.yml` and
-   `ci/extensions/*`, a `glab ci lint` job, and tag a release. Source of truth for steps 1–3.
+0. **Implement the template** — **done** (item 103): `ci/ubixcore-pipeline.yml`, `ci/tests/`.
+   Still to do: `ci/extensions/*`, a lint job in the framework pipeline, and the release tag
+   (the owner's). Source of truth for steps 1–3.
 1. **Docs page on ubixsys-web** — public reference for the pipeline jobs.
    - Page: `site/src/pages/docs/ci-pipeline.astro` → `/docs/ci-pipeline` (the site has only
      marketing pages today, so this also creates the first `docs/` section; link it from the
