@@ -40,8 +40,8 @@ json_escape() {
     printf '%s' "$s"
 }
 
-# vault_for_branch [ref] — sets VAULT_ADDR and VAULT_TOKEN for a branch (default:
-# CI_COMMIT_REF_NAME, then the current git branch).
+# vault_for_branch [ref] — sets VAULT_ADDR and VAULT_TOKEN for a branch. An empty or
+# missing ref means CI_COMMIT_REF_NAME, then the current git branch.
 vault_for_branch() {
     local ref="${1:-${CI_COMMIT_REF_NAME:-$(git rev-parse --abbrev-ref HEAD 2>/dev/null)}}"
     local tier=dev
@@ -60,7 +60,7 @@ vault_for_branch() {
 # vault_read_key <full-path-under-secret> <key> — prints the value, or nothing.
 vault_read_key() {
     local path="$1" key="$2"
-    vault_for_branch
+    vault_for_branch ""
     [ -n "${VAULT_TOKEN:-}" ] || return 0
     curl -sS -m 10 -H "X-Vault-Token: $VAULT_TOKEN" "$VAULT_ADDR/v1/secret/data/${path}" 2>/dev/null \
         | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["data"].get(sys.argv[1], ""))' "$key" 2>/dev/null \
@@ -91,7 +91,7 @@ discord() {
     local channel="$1" color="$2" title="$3" text="$4" url payload sender
     url="$(discord_webhook "$channel")"
     if [ -z "$url" ]; then
-        vault_for_branch
+        vault_for_branch ""
         echo "No Discord webhook for #${channel}: skipping notify (tried \$DISCORD_$(printf '%s' "$channel" | tr '[:lower:]' '[:upper:]')_WEBHOOK_URL, then ${channel}_webhook_url at secret/$(ubix_vault_prefix)/discord and secret/ubixcore/discord on ${VAULT_ADDR}; CI token $([ -n "${VAULT_TOKEN:-}" ] && echo present || echo MISSING))"
         return 0
     fi
