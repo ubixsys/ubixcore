@@ -194,8 +194,11 @@ Declared under `variables:` in the template with defaults; hosts set them in the
 | `UBIX_PROD_DEPLOY_WHEN` | `manual` | `manual` or `on_success` |
 | `UBIX_APP_DB_HOST` | empty = `%` on dev, `10.50.%` on staging/prod | grants host pattern; one value for every tier when set |
 | `UBIX_APPROVAL_OWNERS` | empty (required if approval used) | usernames whose Approve/👍 counts |
-| `UBIX_NOTIFY_SCRIPT` | `bin/lib/notify.sh` | notification helper |
-| `UBIX_DEPLOY_SCRIPT` / `UBIX_PROMOTE_SCRIPT` | `bin/deploy.sh` / `bin/promote.sh` | entry points |
+| `UBIX_STAGING_VAULT` | `prod` | which uBixVault (and CI token) the staging branch reads: `prod` or `dev` (added 0.47.0) |
+| `UBIX_CORE_PROJECT` | `ubixsys/ubixcore` | where `ci/bin` is fetched from (added 0.47.0) |
+| `UBIX_CORE_REF` | empty = the `ubixsys/ubixcore` version in `composer.lock` | the `ci/bin` version (added 0.47.0) |
+| `UBIX_NOTIFY_SCRIPT` | empty = uBixCore's `ci/bin/lib/notify.sh` | a path in the app to use its own helper instead (default changed in 0.47.0) |
+| `UBIX_DEPLOY_SCRIPT` / `UBIX_PROMOTE_SCRIPT` | empty = uBixCore's `ci/bin/deploy.sh` / `ci/bin/promote.sh` | a path in the app to use its own instead (default changed in 0.47.0) |
 
 ### 3.5 Overriding
 
@@ -213,15 +216,40 @@ Declared under `variables:` in the template with defaults; hosts set them in the
 ### 3.6 What an app must provide
 
 1. `Dockerfile` (+ `Dockerfile_Staging`, `Dockerfile_Main`, `Dockerfile_Test`; names via variables).
-2. `app/*/<tier>-deploy.yaml` (and ingress/service) and `bin/deploy.sh`, `bin/promote.sh`
-   (the skeleton ships working versions).
-3. `bin/lib/notify.sh` with `vault_kv` and the notify helper.
+2. `app/<App>/<tier>-deploy.yaml`, and optionally `-service.yaml`, `-ingress.yaml`,
+   `-cronjob*.yaml`, where `<tier>` is the branch slug (`dev`, `staging`, `main`).
+3. Nothing else for scripts. Since 0.47.0 the deploy, promote and notify scripts are
+   uBixCore's (`ci/bin/`), fetched at the version in the app's `composer.lock` with the job
+   token (so the app must be on ubixcore's job-token allowlist, which Composer already
+   needs). An app that must differ points `UBIX_*_SCRIPT` at its own copy; the aim is that
+   none does. See §3.8.
 4. A uBixVault tree under `secret/<UBIX_VAULT_PREFIX>/` (`db-dev|staging|prod`, `test-db`,
    `composer`) and the read-only CI tokens as masked GitLab variables.
 5. `sql/grants/app.sql` if a dedicated DDL account is used.
 6. Runner(s) with the configured tags, buildx builder, kubeconfigs.
 7. Branch protection: `dev`, `staging`, `main` protected; `main` MR-only; protected
    environment `production` for who may press the prod deploy.
+
+### 3.8 Shared scripts (`ci/bin`, 0.47.0)
+
+uBixCore is the monorepo's architecture, so tooling every app needs lives here, not in each
+app. Before 0.47.0 each app carried `bin/deploy.sh`, `bin/promote.sh` and `bin/lib/notify.sh`
+(seeded from the skeleton), and the copies drifted: kitg's promote gained fail-closed checks,
+Kelpie's deploy gained a rollout wait, and the skeleton's `vault_kv` ignored the prefix the
+template exports. `ci/bin/` now holds one version of each, combining the fixes:
+
+| Script | What it does |
+|---|---|
+| `lib/notify.sh` | `vault_for_branch` (prod branch → prod Vault; staging → `UBIX_STAGING_VAULT`; else dev), `vault_kv <path> <key>` under `secret/<VAULT_KV_PREFIX>/`, `discord <channel> <color> <title> <text>` |
+| `deploy.sh <slug>` | applies each `app/<App>/<slug>-{deploy,service,ingress,cronjob*}.yaml` on every `UBIX_KUBECONFIGS` cluster, then waits for each Deployment's rollout (`UBIX_ROLLOUT_TIMEOUT`, default 300s; `0` skips) |
+| `promote.sh <branch>` | fast-forward only; halts on a `Destructive:` migration unless acknowledged; refuses when it cannot resolve the target or diff the migrations |
+| `vault-set-key.sh` | for people, not CI: sets one key in a KV v2 secret by read-merge-write with check-and-set, the value typed at a prompt or piped from a file, never in argv. In an app: `vendor/ubixsys/ubixcore/ci/bin/vault-set-key.sh` |
+
+The template's hidden `.ubix_ci_fn` defines `ubix_ci_scripts`, which shallow-clones
+`UBIX_CORE_PROJECT` at the locked version into `$CI_PROJECT_DIR.tmp/ubix-ci` (outside the
+checkout, so a `docker build .` never copies it). It is fetched rather than read from the
+image because the build job needs `vault_kv` before any image exists. Tests:
+`ci/tests/scripts-test.sh` (offline, fake `kubectl`), run by uBixCore's `ci-template` job.
 
 ### 3.7 Branch and pipeline model
 

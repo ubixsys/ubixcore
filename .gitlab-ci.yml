@@ -92,6 +92,23 @@ static-checks:
         "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA-test" \
         sh -c "set -e && vendor/bin/phpcs --no-cache && vendor/bin/phpstan analyse --no-progress --memory-limit=2G bin php public tests"
 
+# The shared CI template and its scripts (ci/): shellcheck, the offline ci/bin tests
+# (fake kubectl, no network) and yamllint. Independent of the image, so it starts at
+# once. Packages are fetched into a throwaway container.
+ci-template:
+  extends: .on_any_ref
+  stage: lint-and-test
+  tags: [shell]
+  needs: []
+  timeout: 10 minutes
+  script:
+    - |
+      docker run --rm -v "$PWD:/src" --workdir /src alpine:3.22 sh -c \
+        "set -e && apk add --no-cache bash git python3 shellcheck yamllint >/dev/null \
+         && shellcheck -x ci/bin/*.sh ci/bin/lib/notify.sh ci/tests/*.sh \
+         && bash ci/tests/scripts-test.sh \
+         && bash ci/tests/lint.sh --offline"
+
 # PHPUnit against the unit-test MariaDB (`ubixcore-test-db` container on the
 # runner host). `database:resetSchema test` rebuilds every sql/<name>.sql —
 # for the framework that is sql/ubixcore_test.sql, its own fixture schema.
