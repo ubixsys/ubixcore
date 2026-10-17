@@ -1,19 +1,26 @@
 # Changelog
 
-## Unreleased
+## 0.47.0 - 2026-10-17
 
 ### CI template
 
+- New: `ci/ubixcore-pipeline.yml`, the shared GitLab CI pipeline for uBixCore apps (build,
+  test, migrate, deploy, promote, notify, approval, maintenance), tuned with `UBIX_*`
+  variables. Include it pinned to this tag. Design: `docs/design/ci-pipeline-template.md`.
 - `ci/bin/`: the deploy, promote and notify scripts apps used to copy now ship with uBixCore,
   one version combining the copies' fixes: promote refuses when it cannot check the batch for
   destructive migrations, deploy also applies `-cronjob*.yaml` and waits for each rollout,
   `vault_kv` reads `secret/<prefix>/` (the skeleton's copy ignored the prefix). Also
   `ci/bin/vault-set-key.sh` (from kitg) for writing one secret key safely.
 - The template runs those scripts by default, fetched at the uBixCore version in the app's
-  `composer.lock`. `UBIX_NOTIFY_SCRIPT`, `UBIX_DEPLOY_SCRIPT` and `UBIX_PROMOTE_SCRIPT` now
-  default to empty; set one to a path to keep an app's own script.
+  `composer.lock`. Set `UBIX_NOTIFY_SCRIPT`, `UBIX_DEPLOY_SCRIPT` or `UBIX_PROMOTE_SCRIPT` to a
+  path to use an app's own script instead.
 - `UBIX_STAGING_VAULT` (`prod` default, or `dev`): which uBixVault the staging branch reads.
 - uBixCore's own pipeline runs shellcheck, the script tests and yamllint (`ci-template`).
+
+### Console
+
+- Fix: `code:review` no longer crashes when PHPStan's result cache is missing or unreadable.
 
 ## 0.46.1 - 2026-10-13
 
