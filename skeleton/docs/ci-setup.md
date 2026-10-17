@@ -4,16 +4,65 @@ Everything the pipeline in `.gitlab-ci.yml` needs before it goes green, in the
 order to create it. Secrets live in **uBixVault**; GitLab holds only the
 read-only tokens that let jobs fetch them. Nothing here is committed.
 
-Stages: `build` (runtime image + test image + optional node image) →
-`lint-and-test` (phpcs, phpstan, phpunit, js-lint) → `deploy` (`bin/deploy.sh
-<env>` applies `app/*/<env>-{deploy,ingress,service}.yaml`) → `promote`
-(`bin/promote.sh` fast-forwards dev → staging → main) → `notify` (Discord).
+The pipeline is **not** written in this project: `.gitlab-ci.yml` includes uBixCore's
+shared template and keeps only this project's overrides (section 0).
+
+## 0. The include, the jobs it brings, and overriding them
+
+```yaml
+include:
+  - project: ubixsys/ubixcore
+    ref: v0.47.0
+    file: ci/ubixcore-pipeline.yml
+```
+
+Pin `ref` to a uBixCore release tag, never `main`. Keep it in step with the
+`ubixsys/ubixcore` version in `composer.lock`: the template also fetches the
+deploy, promote and notify scripts (`ci/bin`) from uBixCore at that locked
+version, so apps keep no copies. The `ref:` line is marked `ubixcore-ref` so a
+tool can find it. Upgrading is `composer update ubixsys/ubixcore`, bump `ref`,
+commit both.
+
+Stages and the jobs the template brings (`<tier>` is `dev`, `staging`, `prod`):
+
+| Stage | Jobs |
+|---|---|
+| `build` | `build-<tier>`, `build-mr` (runtime image, test image, optional node/go images) |
+| `test` | `static-checks-*` (phpcs, phpstan), `phpunit-*`, `js-lint-*`, `go-checks-*`, `ai-review-mr` |
+| `migrate` | `migrate-verify-*`, `migrate-apply-*` (+ `-destructive` manual variants), optional `drift-*` |
+| `deploy` | `deploy-<tier>` (applies `app/*/<tier>-{deploy,ingress,service}.yaml`; prod is manual by default) |
+| `promote` | `promote-to-staging`, `promote-to-prod` (+ `-destructive`): fast-forward dev → staging → main |
+| `notify` | `notify-failure-<tier>` (Discord) |
+| `approval` | `require-approval-mr`: an owner's Approve or 👍 is required to merge |
+| `maintenance` | scheduled `cron:<task>` jobs, which you define (below) |
+
+Pipelines run for merge requests, schedules, and pushes to `dev`, `staging` and
+`main`; a feature-branch push runs none.
+
+Overriding, from least to most invasive:
+
+1. **Variables.** Set a `UBIX_*` variable in this file's `variables:` (or in
+   CI/CD settings; project variables win). The ones you will touch:
+   `UBIX_APPROVAL_OWNERS` (required), `UBIX_TIERS`, `UBIX_MIGRATE_ENABLED`,
+   `UBIX_PROD_DEPLOY_WHEN`, `UBIX_BUILD_TAG` / `UBIX_DEPLOY_TAG` (runner tags),
+   `UBIX_*_DOCKERFILE_*`, `UBIX_PHPSTAN_PATHS`, `UBIX_VAULT_PREFIX`. All are
+   declared with defaults at the top of the template.
+2. **Change a job.** Redefine it by name; keys merge, `script` replaces:
+   `phpunit-dev: { variables: { MY_FLAG: "1" } }`.
+3. **Drop a job.** `ai-review-mr: { rules: [{ when: never }] }`.
+4. **Add a job.** Extend a hidden base: `extends: [.ubix_static_checks, .ubix_on_dev]`.
+   A maintenance task:
+   `purge: { extends: .ubix_maintenance, rules: [{ if: '$CI_PIPELINE_SOURCE == "schedule" && $MAINTENANCE_TASK == "purge"' }] }`.
+5. **Your own scripts.** Point `UBIX_DEPLOY_SCRIPT`, `UBIX_PROMOTE_SCRIPT` or
+   `UBIX_NOTIFY_SCRIPT` at a path in this project instead of uBixCore's.
+
+Full variable list and rationale: `docs/design/ci-pipeline-template.md` in uBixCore.
 
 ## 1. A runner
 
-Any GitLab runner with the tag `shell`, Docker with a buildx builder named
-`multiarch-builder`, and kubeconfigs for your clusters at the paths
-`bin/deploy.sh` expects (`/home/gitlab-runner/.kube/devstageconfig`, …). An
+Any GitLab runner with the tag `shell` (or the tags set in `UBIX_BUILD_TAG` /
+`UBIX_DEPLOY_TAG`), Docker with a buildx builder named `multiarch-builder`, and
+kubeconfigs for your clusters at the paths uBixCore's `ci/bin/deploy.sh` expects (`/home/gitlab-runner/.kube/devstageconfig`, …). An
 instance-wide shared runner serves every project with no per-project setup.
 
 ## 2. Access to uBixCore (the private Composer registry)
@@ -26,8 +75,8 @@ first and falls back to the second:
   deploy token with `read_package_registry`; store it as
   `secret/<project>/composer` with keys `username` and `token` (step 4 does this).
 - **Job token allowlist:** on the `ubixsys/ubixcore` project, Settings → CI/CD
-  → Job token permissions, add your project (only needed while the packages
-  come from a private GitLab registry).
+  → Job token permissions, add your project. Needed regardless of the registry:
+  the template clones `ci/bin` from that project with the job token.
 - **Base image:** the Dockerfiles default to the public
   `ghcr.io/ubixsys/ubixcore-php:8.5`; nothing to configure. To build from a
   private mirror instead, pass `--build-arg BASE_IMAGE=<registry>/<image>:<tag>`
@@ -42,7 +91,11 @@ Developers also need the token locally, once:
 |---|---|---|
 | `UBIXVAULT_CI_TOKEN_DEV` | read-only Vault token for the dev branch | printed by `bin/vault-ci-setup.sh dev <project>` |
 | `UBIXVAULT_CI_TOKEN_PROD` | same for staging/main | `bin/vault-ci-setup.sh prod <project>` |
-| `GITLAB_PROMOTE_TOKEN` | lets `bin/promote.sh` push staging/main | project access token on **this** project: Maintainer, scopes `api` + `write_repository` |
+| `GITLAB_PROMOTE_TOKEN` | lets the promote jobs push staging/main | project access token on **this** project: Maintainer, scopes `api` + `write_repository` |
+
+`APPROVAL_GITLAB_TOKEN` (or `AI_REVIEW_GITLAB_TOKEN`; Reporter, `api`, masked,
+not protected) lets `require-approval-mr` read approvals and 👍. Also set
+`UBIX_APPROVAL_OWNERS` in `.gitlab-ci.yml`.
 
 `CI_REGISTRY_*` and `CI_JOB_TOKEN` are provided by GitLab.
 
@@ -65,7 +118,7 @@ It creates the policy `<project>-ci-ro` (read on `secret/<project>/*`), writes
 |---|---|---|
 | `secret/<project>/test-db` | host, port, username, password, database | phpunit job (`database:resetSchema test`, `migrate:up`) |
 | `secret/<project>/composer` | username, token | build job (Composer auth as a BuildKit secret) |
-| `secret/<project>/discord` | ops_webhook_url, alerts_webhook_url, reviews_webhook_url | `bin/lib/notify.sh` |
+| `secret/<project>/discord` | ops_webhook_url, alerts_webhook_url, reviews_webhook_url | uBixCore `ci/bin/lib/notify.sh` |
 | `secret/<project>/db-<tier>` (`dev`, `staging`, `prod`) | host, port, database, write_username, write_password; optional migration_username, migration_password (a dedicated DDL user, recommended) | migrate jobs (`migrate:status` + `migrate:up --target=<tier>` before each deploy) |
 | `secret/<app>/<env>/db` | read_username, read_password, write_username, write_password | the running pods (`VAULT_ADDR` + `VAULT_K8S_ROLE`, see the app manifests) |
 
