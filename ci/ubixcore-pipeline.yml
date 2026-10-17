@@ -6,19 +6,20 @@
 #
 #   include:
 #     - project: ubixsys/ubixcore
-#       ref: v0.46.0
+#       ref: v0.47.0
 #       file: ci/ubixcore-pipeline.yml
 #
 # Everything a host tunes is a UBIX_* variable (section 1). Hidden `.ubix_*` jobs are
 # public API: `extends:` them to add a job, redefine a concrete job by name to change it,
 # or redefine it with `rules: [{ when: never }]` to drop it. Spec and rationale:
 # docs/design/ci-pipeline-template.md. What the host must provide (Dockerfiles, app/*/
-# <tier>-deploy.yaml, bin/deploy.sh, bin/promote.sh, bin/lib/notify.sh, a uBixVault tree
-# under secret/<UBIX_VAULT_PREFIX>/) is section 3.6 of that doc.
+# <tier>-deploy.yaml, a uBixVault tree under secret/<UBIX_VAULT_PREFIX>/) is section 3.6
+# of that doc. The scripts the jobs run (deploy, promote, notify) are uBixCore's ci/bin,
+# fetched at the app's locked version (section 3.8); apps keep no copies.
 #
-# Credentials never live here: the jobs read them from uBixVault through the host's
-# bin/lib/notify.sh (`vault_kv`, `discord`) with the read-only CI tokens
-# UBIXVAULT_CI_TOKEN_DEV / UBIXVAULT_CI_TOKEN_PROD (masked GitLab variables).
+# Credentials never live here: the jobs read them from uBixVault through ci/bin/lib/notify.sh
+# (`vault_kv`, `discord`) with the read-only CI tokens UBIXVAULT_CI_TOKEN_DEV /
+# UBIXVAULT_CI_TOKEN_PROD (masked GitLab variables).
 
 # ---------------------------------------------------------------------------
 # 1. Variables (override in the host's own `variables:`; project variables win)
@@ -44,9 +45,12 @@ variables:
   UBIX_PROD_DEPLOY_WHEN: manual         # manual | on_success
   UBIX_APP_DB_HOST: ""                  # grants host pattern; empty = "%" on dev, "10.50.%" elsewhere
   UBIX_APPROVAL_OWNERS: ""              # usernames whose Approve/👍 counts; required by require-approval-mr
-  UBIX_NOTIFY_SCRIPT: bin/lib/notify.sh
-  UBIX_DEPLOY_SCRIPT: bin/deploy.sh
-  UBIX_PROMOTE_SCRIPT: bin/promote.sh
+  UBIX_STAGING_VAULT: prod              # which uBixVault the staging branch reads: prod | dev
+  UBIX_CORE_PROJECT: ubixsys/ubixcore   # where the ci/bin scripts come from
+  UBIX_CORE_REF: ""                     # ci/bin version; empty = ubixsys/ubixcore's version in composer.lock
+  UBIX_NOTIFY_SCRIPT: ""                # empty = uBixCore's ci/bin/lib/notify.sh; a path = the app's own
+  UBIX_DEPLOY_SCRIPT: ""                # empty = uBixCore's ci/bin/deploy.sh
+  UBIX_PROMOTE_SCRIPT: ""               # empty = uBixCore's ci/bin/promote.sh
   UBIX_PHPSTAN_PATHS: "app bin php public tests"
   UBIX_JS_TEST_SKIP: ""                 # app/*Js names whose `npm test` cannot run in the plain node image
   UBIX_AI_REVIEW_GUIDE: bin/ci/ai-review-guide.md  # host rules for ci:aiReview; ignored if the file is absent
@@ -99,6 +103,37 @@ default:
   script:
     - |
       apps_with_suffix() { for d in app/*"$1"/; do [ -d "$d" ] && basename "$d"; done; return 0; }
+
+# uBixCore's CI scripts (ci/bin: lib/notify.sh, deploy.sh, promote.sh) at the version the
+# app locks in composer.lock, so they always match the framework the image was built with.
+# Fetched once per job with the job token (the project is already on ubixcore's job-token
+# allowlist for Composer), outside the checkout so a docker build never copies it.
+# `ubix_ci_scripts` sets UBIX_NOTIFY, UBIX_DEPLOY and UBIX_PROMOTE; a UBIX_*_SCRIPT variable
+# set to a path in the app wins over the shared copy.
+# Use as: script: [!reference [.ubix_ci_fn, script], "ubix_ci_scripts || exit 1; ..."]
+.ubix_ci_fn:
+  script:
+    - |
+      ubix_ci_scripts() {
+        local dir="${CI_PROJECT_DIR}.tmp/ubix-ci" ref="${UBIX_CORE_REF:-}"
+        if [ ! -f "$dir/ci/bin/lib/notify.sh" ]; then
+          if [ -z "$ref" ]; then
+            ref="$(python3 -c 'import json,sys; print(next((p["version"] for p in json.load(open(sys.argv[1]))["packages"] if p["name"] == "ubixsys/ubixcore"), ""))' composer.lock 2>/dev/null || true)"
+            [ -n "$ref" ] || { echo "ubix_ci_scripts: ubixsys/ubixcore is not in composer.lock; set UBIX_CORE_REF" >&2; return 1; }
+            case "$ref" in dev-*) ref="${ref#dev-}" ;; v*) ;; *) ref="v$ref" ;; esac
+          fi
+          rm -rf "$dir"; mkdir -p "${CI_PROJECT_DIR}.tmp"
+          git -c advice.detachedHead=false clone -q --depth 1 --branch "$ref" \
+            "https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/${UBIX_CORE_PROJECT}.git" "$dir" \
+            || { echo "ubix_ci_scripts: could not fetch ${UBIX_CORE_PROJECT}@${ref} (is this project on its job-token allowlist?)" >&2; return 1; }
+          [ -f "$dir/ci/bin/lib/notify.sh" ] || { echo "ubix_ci_scripts: ${UBIX_CORE_PROJECT}@${ref} has no ci/bin (it ships from 0.47.0): update ubixsys/ubixcore, or set UBIX_*_SCRIPT to the app's own scripts" >&2; return 1; }
+          echo "uBixCore CI scripts: ${UBIX_CORE_PROJECT}@${ref}"
+        fi
+        UBIX_NOTIFY="${UBIX_NOTIFY_SCRIPT:-$dir/ci/bin/lib/notify.sh}"
+        UBIX_DEPLOY="${UBIX_DEPLOY_SCRIPT:-$dir/ci/bin/deploy.sh}"
+        UBIX_PROMOTE="${UBIX_PROMOTE_SCRIPT:-$dir/ci/bin/promote.sh}"
+        export VAULT_KV_PREFIX="$UBIX_VAULT_PREFIX" UBIX_PROJECT_DIR="$CI_PROJECT_DIR"
+      }
 
 # The rule conditions, written once. Branch conditions never match schedules.
 .ubix_if:
@@ -169,6 +204,7 @@ default:
       - unknown_failure
   script:
     - !reference [.ubix_apps_fn, script]
+    - !reference [.ubix_ci_fn, script]
     - |
       set -euo pipefail
       RUNTIME_REF="${CI_REGISTRY_IMAGE}:${CI_COMMIT_REF_SLUG}"
@@ -190,7 +226,7 @@ default:
       # BuildKit secret (never a layer): a deploy token from uBixVault
       # (secret/<prefix>/composer: username + token, read_package_registry) if present,
       # else this job's CI_JOB_TOKEN (needs this project on ubixcore's job-token allowlist).
-      SCRIPT_DIR="$CI_PROJECT_DIR"; . "$UBIX_NOTIFY_SCRIPT"; export VAULT_KV_PREFIX="$UBIX_VAULT_PREFIX"
+      ubix_ci_scripts || exit 1; . "$UBIX_NOTIFY"
       CU="$(vault_kv composer username)"; CT="$(vault_kv composer token)"
       if [ -n "$CT" ]; then AUTH_USER="$CU"; AUTH_TOKEN="$CT"; else AUTH_USER="gitlab-ci-token"; AUTH_TOKEN="$CI_JOB_TOKEN"; fi
       AUTH_FILE="$(mktemp)"; trap 'rm -f "$AUTH_FILE"' EXIT
@@ -261,8 +297,9 @@ build-mr:      { extends: [.ubix_build, .ubix_on_mr] }
   tags: [$UBIX_BUILD_TAG]
   timeout: 30 minutes
   script:
+    - !reference [.ubix_ci_fn, script]
     - |
-      set -u; SCRIPT_DIR="$CI_PROJECT_DIR"; . "$UBIX_NOTIFY_SCRIPT"; export VAULT_KV_PREFIX="$UBIX_VAULT_PREFIX"
+      set -u; ubix_ci_scripts || exit 1; . "$UBIX_NOTIFY"
       export TEST_MYSQL_WRITE_HOST="$(vault_kv test-db host)" TEST_MYSQL_WRITE_PORT="$(vault_kv test-db port)"
       export TEST_MYSQL_WRITE_USERNAME="$(vault_kv test-db username)" TEST_MYSQL_WRITE_PASSWORD="$(vault_kv test-db password)"
       export TEST_MYSQL_WRITE_DATABASE="$(vault_kv test-db database)"
@@ -432,8 +469,9 @@ ai-review-mr:
     UBIX_MIGRATE_MODE: apply   # verify | apply
     MIGRATE_ACK: ""            # --i-acknowledge-destructive on the *-destructive jobs
   script:
+    - !reference [.ubix_ci_fn, script]
     - |
-      set -u; SCRIPT_DIR="$CI_PROJECT_DIR"; . "$UBIX_NOTIFY_SCRIPT"; export VAULT_KV_PREFIX="$UBIX_VAULT_PREFIX"
+      set -u; ubix_ci_scripts || exit 1; . "$UBIX_NOTIFY"
       T="$UBIX_TIER"
       export MYSQL_WRITE_HOST="$(vault_kv db-$T host)" MYSQL_WRITE_PORT="$(vault_kv db-$T port)"
       export MYSQL_WRITE_DATABASE="$(vault_kv db-$T database)"
@@ -623,8 +661,9 @@ migrate-apply-prod-destructive:
   variables:
     UBIX_DRIFT_EXTRA_DBS: ""
   script:
+    - !reference [.ubix_ci_fn, script]
     - |
-      set -u; SCRIPT_DIR="$CI_PROJECT_DIR"; . "$UBIX_NOTIFY_SCRIPT"; export VAULT_KV_PREFIX="$UBIX_VAULT_PREFIX"
+      set -u; ubix_ci_scripts || exit 1; . "$UBIX_NOTIFY"
       T="$UBIX_TIER"
       export MYSQL_WRITE_HOST="$(vault_kv db-$T host)" MYSQL_WRITE_PORT="$(vault_kv db-$T port)"
       export MYSQL_WRITE_DATABASE="$(vault_kv db-$T database)"
@@ -674,7 +713,7 @@ drift-staging: { extends: [.ubix_drift, .ubix_on_staging], needs: [migrate-apply
 drift-prod:    { extends: [.ubix_drift, .ubix_on_prod],    needs: [migrate-apply-prod],    rules: [{ if: *if_drift_prod }] }
 
 # ---------------------------------------------------------------------------
-# deploy — `bash bin/deploy.sh <ref-slug>` (posts its own result note).
+# deploy — ci/bin/deploy.sh <ref-slug>: applies and waits for the rollout (posts its own note).
 # needs: the build, the tier's migrate jobs and the test jobs, so a held destructive
 # migration or a red gate stops the deploy. Migrate and the js/go jobs are optional
 # needs: they are absent when UBIX_MIGRATE_ENABLED=false or the repo has no such app.
@@ -686,7 +725,8 @@ drift-prod:    { extends: [.ubix_drift, .ubix_on_prod],    needs: [migrate-apply
   tags: [$UBIX_DEPLOY_TAG]
   interruptible: false
   script:
-    - bash "$UBIX_DEPLOY_SCRIPT" "$CI_COMMIT_REF_SLUG"
+    - !reference [.ubix_ci_fn, script]
+    - ubix_ci_scripts || exit 1; bash "$UBIX_DEPLOY" "$CI_COMMIT_REF_SLUG"
 
 deploy-dev:
   extends: [.ubix_deploy, .ubix_on_dev]
@@ -729,7 +769,7 @@ deploy-prod:
       allow_failure: false
 
 # ---------------------------------------------------------------------------
-# promote — dev → staging → prod by fast-forward (`bash bin/promote.sh <branch>`),
+# promote — dev → staging → prod by fast-forward (ci/bin/promote.sh <branch>),
 # automatic after a green deploy. promote.sh halts on a Destructive: migration; the
 # *-destructive manual job sets PROMOTE_ACK_DESTRUCTIVE=1 and proceeds. Needs the
 # GITLAB_PROMOTE_TOKEN CI variable. A host with no staging tier defines its own promote.
@@ -744,27 +784,35 @@ promote-to-staging:
   extends: .ubix_promote
   needs: [{ job: deploy-dev, artifacts: false }]
   rules: [{ if: *if_dev, when: on_success, allow_failure: true }]
-  script: [bash "$UBIX_PROMOTE_SCRIPT" "$UBIX_STAGING_BRANCH"]
+  script:
+    - !reference [.ubix_ci_fn, script]
+    - ubix_ci_scripts || exit 1; bash "$UBIX_PROMOTE" "$UBIX_STAGING_BRANCH"
 promote-to-staging-destructive:
   extends: .ubix_promote
   needs: [{ job: deploy-dev, artifacts: false }]
   rules: [{ if: *if_dev, when: manual, allow_failure: true }]
   variables: { GIT_DEPTH: "0", PROMOTE_ACK_DESTRUCTIVE: "1" }
-  script: [bash "$UBIX_PROMOTE_SCRIPT" "$UBIX_STAGING_BRANCH"]
+  script:
+    - !reference [.ubix_ci_fn, script]
+    - ubix_ci_scripts || exit 1; bash "$UBIX_PROMOTE" "$UBIX_STAGING_BRANCH"
 promote-to-prod:
   extends: .ubix_promote
   needs: [{ job: deploy-staging, artifacts: false }]
   rules: [{ if: *if_staging, when: on_success, allow_failure: true }]
-  script: [bash "$UBIX_PROMOTE_SCRIPT" "$UBIX_PROD_BRANCH"]
+  script:
+    - !reference [.ubix_ci_fn, script]
+    - ubix_ci_scripts || exit 1; bash "$UBIX_PROMOTE" "$UBIX_PROD_BRANCH"
 promote-to-prod-destructive:
   extends: .ubix_promote
   needs: [{ job: deploy-staging, artifacts: false }]
   rules: [{ if: *if_staging, when: manual, allow_failure: true }]
   variables: { GIT_DEPTH: "0", PROMOTE_ACK_DESTRUCTIVE: "1" }
-  script: [bash "$UBIX_PROMOTE_SCRIPT" "$UBIX_PROD_BRANCH"]
+  script:
+    - !reference [.ubix_ci_fn, script]
+    - ubix_ci_scripts || exit 1; bash "$UBIX_PROMOTE" "$UBIX_PROD_BRANCH"
 
 # ---------------------------------------------------------------------------
-# notify — a red pipeline posts to #<project>-alerts via the host's notify helper
+# notify — a red pipeline posts to #<project>-alerts via ci/bin/lib/notify.sh
 # ---------------------------------------------------------------------------
 .ubix_notify_failure:
   stage: notify
@@ -772,9 +820,10 @@ promote-to-prod-destructive:
   interruptible: false
   timeout: 5 minutes
   script:
+    - !reference [.ubix_ci_fn, script]
     - |
       set -u
-      SCRIPT_DIR="$CI_PROJECT_DIR"; . "$UBIX_NOTIFY_SCRIPT"; export VAULT_KV_PREFIX="$UBIX_VAULT_PREFIX"
+      ubix_ci_scripts || exit 1; . "$UBIX_NOTIFY"
       WHO="${GITLAB_USER_NAME:-${GITLAB_USER_LOGIN:-unknown}}"
       TEXT="Branch: ${CI_COMMIT_REF_NAME} — pushed by ${WHO}
       Commit: [${CI_COMMIT_TITLE:-$CI_COMMIT_SHORT_SHA}](${CI_PROJECT_URL}/-/commit/${CI_COMMIT_SHA}) (${CI_COMMIT_SHORT_SHA})
@@ -831,9 +880,10 @@ require-approval-mr:
   rules:
     - if: '$CI_PIPELINE_SOURCE == "schedule" && $MAINTENANCE_TASK'
   script:
+    - !reference [.ubix_ci_fn, script]
     - |
       set -euo pipefail
-      SCRIPT_DIR="$CI_PROJECT_DIR"; . "$UBIX_NOTIFY_SCRIPT"; export VAULT_KV_PREFIX="$UBIX_VAULT_PREFIX"
+      ubix_ci_scripts || exit 1; . "$UBIX_NOTIFY"
       TIER="${MAINTENANCE_TIER:-dev}"
       export MYSQL_WRITE_HOST="$(vault_kv db-$TIER host)" MYSQL_WRITE_PORT="$(vault_kv db-$TIER port)"
       export MYSQL_WRITE_DATABASE="$(vault_kv db-$TIER database)"

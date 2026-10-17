@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### CI template
+
+- `ci/bin/`: the deploy, promote and notify scripts apps used to copy now ship with uBixCore,
+  one version combining the copies' fixes: promote refuses when it cannot check the batch for
+  destructive migrations, deploy also applies `-cronjob*.yaml` and waits for each rollout,
+  `vault_kv` reads `secret/<prefix>/` (the skeleton's copy ignored the prefix). Also
+  `ci/bin/vault-set-key.sh` (from kitg) for writing one secret key safely.
+- The template runs those scripts by default, fetched at the uBixCore version in the app's
+  `composer.lock`. `UBIX_NOTIFY_SCRIPT`, `UBIX_DEPLOY_SCRIPT` and `UBIX_PROMOTE_SCRIPT` now
+  default to empty; set one to a path to keep an app's own script.
+- `UBIX_STAGING_VAULT` (`prod` default, or `dev`): which uBixVault the staging branch reads.
+- uBixCore's own pipeline runs shellcheck, the script tests and yamllint (`ci-template`).
+
 ## 0.46.1 - 2026-10-13
 
 ### uBixOps
