@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Ubix\Middleware;
 
+use InvalidArgumentException;
 use Psr\Http\Message\ResponseFactoryInterface as ResponseFactory;
 use Psr\Http\Message\ResponseInterface as Response;
 use Psr\Http\Message\ServerRequestInterface as Request;
@@ -28,14 +29,19 @@ final class RoleAuthorizationMiddleware implements Middleware
      * @param Logger          $logger          The Monolog logger
      * @param ResponseFactory $responseFactory Response factory for creating responses
      * @param JsonService     $jsonService     JSON encoder for error bodies
-     * @param string          $requiredRole    The role the session must hold
+     * @param string          $requiredRole    The role the session must hold (no default; the host names its own)
+     *
+     * @throws InvalidArgumentException When the role is empty or whitespace
      */
     public function __construct(
         private Logger $logger,
         private ResponseFactory $responseFactory,
         private JsonService $jsonService,
-        private string $requiredRole = 'supporter',
+        private string $requiredRole,
     ) {
+        if (trim($requiredRole) === '') {
+            throw new InvalidArgumentException('The required role must not be empty');
+        }
     }
 
     /**
