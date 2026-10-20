@@ -45,12 +45,14 @@ variables:
   UBIX_PROD_DEPLOY_WHEN: manual         # manual | on_success
   UBIX_APP_DB_HOST: ""                  # grants host pattern; empty = "%" on dev, "10.50.%" elsewhere
   UBIX_APPROVAL_OWNERS: ""              # usernames whose Approve/👍 counts; required by require-approval-mr
+  UBIX_APPROVAL_ARMS_MERGE: "false"     # "true": a verified sign-off also arms merge-when-pipeline-succeeds (needs APPROVAL_MERGE_TOKEN)
   UBIX_STAGING_VAULT: prod              # which uBixVault the staging branch reads: prod | dev
   UBIX_CORE_PROJECT: ubixsys/ubixcore   # where the ci/bin scripts come from
   UBIX_CORE_REF: ""                     # ci/bin version; empty = ubixsys/ubixcore's version in composer.lock
   UBIX_NOTIFY_SCRIPT: ""                # empty = uBixCore's ci/bin/lib/notify.sh; a path = the app's own
   UBIX_DEPLOY_SCRIPT: ""                # empty = uBixCore's ci/bin/deploy.sh
   UBIX_PROMOTE_SCRIPT: ""               # empty = uBixCore's ci/bin/promote.sh
+  UBIX_ARM_MERGE_SCRIPT: ""             # empty = uBixCore's ci/bin/arm-merge.sh
   UBIX_PHPSTAN_PATHS: "app bin php public tests"
   UBIX_JS_TEST_SKIP: ""                 # app/*Js names whose `npm test` cannot run in the plain node image
   UBIX_AI_REVIEW_GUIDE: bin/ci/ai-review-guide.md  # host rules for ci:aiReview; ignored if the file is absent
@@ -104,11 +106,11 @@ default:
     - |
       apps_with_suffix() { for d in app/*"$1"/; do [ -d "$d" ] && basename "$d"; done; return 0; }
 
-# uBixCore's CI scripts (ci/bin: lib/notify.sh, deploy.sh, promote.sh) at the version the
+# uBixCore's CI scripts (ci/bin: lib/notify.sh, deploy.sh, promote.sh, arm-merge.sh) at the version the
 # app locks in composer.lock, so they always match the framework the image was built with.
 # Fetched once per job with the job token (the project is already on ubixcore's job-token
 # allowlist for Composer), outside the checkout so a docker build never copies it.
-# `ubix_ci_scripts` sets UBIX_NOTIFY, UBIX_DEPLOY and UBIX_PROMOTE; a UBIX_*_SCRIPT variable
+# `ubix_ci_scripts` sets UBIX_NOTIFY, UBIX_DEPLOY, UBIX_PROMOTE and UBIX_ARM_MERGE; a UBIX_*_SCRIPT variable
 # set to a path in the app wins over the shared copy.
 # Use as: script: [!reference [.ubix_ci_fn, script], "ubix_ci_scripts || exit 1; ..."]
 .ubix_ci_fn:
@@ -132,6 +134,7 @@ default:
         UBIX_NOTIFY="${UBIX_NOTIFY_SCRIPT:-$dir/ci/bin/lib/notify.sh}"
         UBIX_DEPLOY="${UBIX_DEPLOY_SCRIPT:-$dir/ci/bin/deploy.sh}"
         UBIX_PROMOTE="${UBIX_PROMOTE_SCRIPT:-$dir/ci/bin/promote.sh}"
+        UBIX_ARM_MERGE="${UBIX_ARM_MERGE_SCRIPT:-$dir/ci/bin/arm-merge.sh}"
         export VAULT_KV_PREFIX="$UBIX_VAULT_PREFIX" UBIX_PROJECT_DIR="$CI_PROJECT_DIR"
       }
 
@@ -843,6 +846,9 @@ notify-failure-prod:    { extends: .ubix_notify_failure, rules: [{ if: *if_prod,
 # a pipeline on approval: approve, then retry this job. Its own late stage, so a red
 # verdict neither hides nor holds up the real checks. Token: APPROVAL_GITLAB_TOKEN or
 # AI_REVIEW_GITLAB_TOKEN (Reporter, api, masked, not protected). Agents never approve.
+# With UBIX_APPROVAL_ARMS_MERGE=true a verified sign-off also arms merge-when-pipeline-
+# succeeds (ci/bin/arm-merge.sh, token APPROVAL_MERGE_TOKEN: Developer, api, masked, not
+# protected), so with the uBixOps webhook an Approve/👍 finishes the merge.
 # ---------------------------------------------------------------------------
 require-approval-mr:
   extends: [.ubix_registry_login, .ubix_on_mr]
@@ -851,13 +857,22 @@ require-approval-mr:
   needs: [build-mr]
   timeout: 5 minutes
   script:
+    - !reference [.ubix_ci_fn, script]
     - |
       [ -n "$UBIX_APPROVAL_OWNERS" ] || { echo "require-approval-mr: set UBIX_APPROVAL_OWNERS to the usernames whose Approve/👍 counts"; exit 1; }
+      LOG="$(mktemp)"
       docker run --rm --workdir /web \
         -e APPROVAL_GITLAB_TOKEN -e AI_REVIEW_GITLAB_TOKEN -e MERGE_APPROVAL_OWNERS="$UBIX_APPROVAL_OWNERS" \
         -e CI_API_V4_URL -e CI_PROJECT_ID -e CI_COMMIT_BRANCH -e CI_MERGE_REQUEST_IID \
         "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHA-test" \
-        php bin/ubix ci:requireApproval
+        php bin/ubix ci:requireApproval > "$LOG" 2>&1 && RC=0 || RC=$?
+      cat "$LOG"
+      [ "$RC" -eq 0 ] || exit "$RC"
+      # Armed only on a verified sign-off: the fail-open UNVERIFIED pass is not one.
+      if [ "$UBIX_APPROVAL_ARMS_MERGE" = "true" ] && ! grep -q UNVERIFIED "$LOG"; then
+        ubix_ci_scripts || exit 1
+        bash "$UBIX_ARM_MERGE"
+      fi
 
 # ---------------------------------------------------------------------------
 # maintenance — scheduled `cron:<task>` against a tier. This is the base only: a host

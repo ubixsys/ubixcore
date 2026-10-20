@@ -97,6 +97,15 @@ Developers also need the token locally, once:
 not protected) lets `require-approval-mr` read approvals and 👍. Also set
 `UBIX_APPROVAL_OWNERS` in `.gitlab-ci.yml`.
 
+**Approval finishes the merge (optional).** Set `UBIX_APPROVAL_ARMS_MERGE: "true"` and
+add `APPROVAL_MERGE_TOKEN` (a project or group access token: Developer, `api`, masked,
+not protected). Once `require-approval-mr` has verified an owner's Approve or 👍 (not the
+fail-open `UNVERIFIED` pass) it arms merge-when-pipeline-succeeds on that commit; a later
+push voids it. Pair it with the uBixOps webhook, which re-runs the job on an approval, and
+an Approve or 👍 merges the MR with no further step. GitLab's own gates (Pipelines must
+succeed, resolved threads) still apply. Without the token the job only logs that it did
+not arm. Keep the Reporter token above read-only; this one can merge.
+
 `CI_REGISTRY_*` and `CI_JOB_TOKEN` are provided by GitLab.
 
 ## 4. uBixVault secrets (`secret/<project>/…`)
