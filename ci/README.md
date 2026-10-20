@@ -17,6 +17,9 @@ The shared uBixCore GitLab CI template. Spec and rationale: `docs/design/ci-pipe
   `lib/notify.sh` (`vault_kv`, `discord`), `deploy.sh`, `promote.sh`, and `vault-set-key.sh`
   for people writing secrets. The template fetches them at the uBixCore version in the app's
   `composer.lock`. Design: `docs/design/ci-pipeline-template.md` §3.8.
+- `bin/bump-skeleton-ref.sh` — run by ubixcore's own tag pipeline (`bump-skeleton-ref` job): opens an MR
+  that pins the skeleton's `ref:` (and the snippets in `ci-setup.md` and here) to the new tag.
+  Needs the `BUMP_GITLAB_TOKEN` project access token.
 - `tests/scripts-test.sh` — offline tests for `bin/` (fake `kubectl`, no network).
 - `tests/consumer.gitlab-ci.yml` — an example consumer showing each override style.
 - `tests/lint.sh` — yamllint, `glab ci lint`, and `tests/rules.py` (per-scenario dry runs of the
