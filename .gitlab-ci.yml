@@ -3,7 +3,8 @@
 #   test          build the throwaway test image (Dockerfile_Test, amd64)
 #   lint-and-test phpcs · phpstan (level max) · phpunit, inside that image
 #   publish       on a v* tag: ubixsys/ubixcore (Composer), ubixsys/ubixcore-skeleton
-#                 (Composer, subtree split), @ubixsys/ubixcore (npm)
+#                 (Composer, subtree split), @ubixsys/ubixcore (npm); then an MR that
+#                 bumps the skeleton's pinned CI template ref to the tag
 #   notify        red pipeline → Discord
 #
 # There is no runtime image, deploy or promote here: uBixCore is installed by
@@ -153,6 +154,20 @@ publish-skeleton:
   needs: [publish-composer]
   variables: { GIT_DEPTH: "0" }
   script: [bash bin/publish-skeleton.sh]
+  allow_failure: true
+  only: [tags]
+
+# Opens an MR bumping the pinned template ref in skeleton/.gitlab-ci.yml, ci-setup.md
+# and ci/README.md to this tag (ci/bin/bump-skeleton-ref.sh). Needs BUMP_GITLAB_TOKEN
+# (project access token, Developer, api + write_repository, masked). It lands after the
+# tag, so the skeleton published at vX carries the ref of vX-1 until that MR merges.
+# Never tags, so it cannot retrigger itself; a current ref or an open MR is a no-op.
+bump-skeleton-ref:
+  stage: publish
+  tags: [shell]
+  needs: [publish-skeleton]
+  variables: { GIT_DEPTH: "0" }
+  script: [bash ci/bin/bump-skeleton-ref.sh]
   allow_failure: true
   only: [tags]
 

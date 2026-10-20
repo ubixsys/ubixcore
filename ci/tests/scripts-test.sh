@@ -68,5 +68,24 @@ rm "$T/proj/app/WebApi/"dev-* "$T/proj/app/Worker/"dev-*
 run_deploy; RC=$?
 check "nothing to deploy is an error"            1 "$RC"
 
+# --- bump-skeleton-ref.sh --local -------------------------------------------------
+B="$T/bump"; mkdir -p "$B/skeleton/docs" "$B/ci"
+reset_bump() {
+    printf 'include:\n  - project: ubixsys/ubixcore\n    ref: v0.47.0   # ubixcore-ref: pin\n' > "$B/skeleton/.gitlab-ci.yml"
+    printf '```yaml\n    ref: v0.47.0\n```\n' > "$B/skeleton/docs/ci-setup.md"
+    printf '      ref: v0.47.0\n' > "$B/ci/README.md"
+}
+bump() { UBIX_PROJECT_DIR="$B" bash "$BIN/bump-skeleton-ref.sh" --local "$1"; }
+reset_bump
+check "bump rewrites to a newer tag"             bumped "$(bump v0.48.0)"
+check "bump updates the skeleton pipeline"       1 "$(grep -c 'ref: v0.48.0   # ubixcore-ref' "$B/skeleton/.gitlab-ci.yml")"
+check "bump updates ci-setup.md"                 1 "$(grep -c 'ref: v0.48.0' "$B/skeleton/docs/ci-setup.md")"
+check "bump updates ci/README.md"                1 "$(grep -c 'ref: v0.48.0' "$B/ci/README.md")"
+check "bump of the current tag is a no-op"       current "$(bump v0.48.0)"
+check "bump never downgrades"                    lower "$(bump v0.47.9)"
+check "bump compares versions numerically"       bumped "$(bump v0.100.0)"
+check "bump ignores a non-release tag"           1 "$(UBIX_PROJECT_DIR="$B" bash "$BIN/bump-skeleton-ref.sh" --local rc-1 | grep -c 'not a vN.N.N')"
+check "bump without a token fails"               1 "$(env -i PATH="$PATH" CI_COMMIT_TAG=v9.0.0 bash "$BIN/bump-skeleton-ref.sh" >/dev/null 2>&1; echo $?)"
+
 if [ "$FAILS" -ne 0 ]; then echo "$FAILS failed"; exit 1; fi
 echo "all passed"
