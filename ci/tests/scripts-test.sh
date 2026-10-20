@@ -87,5 +87,26 @@ check "bump compares versions numerically"       bumped "$(bump v0.100.0)"
 check "bump ignores a non-release tag"           1 "$(UBIX_PROJECT_DIR="$B" bash "$BIN/bump-skeleton-ref.sh" --local rc-1 | grep -c 'not a vN.N.N')"
 check "bump without a token fails"               1 "$(env -i PATH="$PATH" CI_COMMIT_TAG=v9.0.0 bash "$BIN/bump-skeleton-ref.sh" >/dev/null 2>&1; echo $?)"
 
+# --- arm-merge.sh against a fake curl ---------------------------------------------
+cat > "$T/fakebin/curl" <<'EOF2'
+#!/usr/bin/env bash
+echo "curl $*" >> "$CURL_LOG"
+out=""; while [ $# -gt 0 ]; do [ "$1" = "-o" ] && out="$2"; shift; done
+echo '{}' > "$out"; printf '%s' "${CURL_CODE:-200}"
+EOF2
+chmod +x "$T/fakebin/curl"
+arm() { : > "$T/curl.log"; env -i PATH="$T/fakebin:$PATH" CURL_LOG="$T/curl.log" CI_API_V4_URL=https://gl/api/v4 CI_PROJECT_ID=7 \
+    CI_COMMIT_SHA=abcdef1234567890 "$@" bash "$BIN/arm-merge.sh"; }
+check "arm without a token does nothing"         0 "$(arm CI_MERGE_REQUEST_IID=5 >/dev/null; grep -c . "$T/curl.log")"
+check "arm without a token still exits 0"        0 "$(arm CI_MERGE_REQUEST_IID=5 >/dev/null; echo $?)"
+check "arm outside an MR does nothing"          0 "$(arm APPROVAL_MERGE_TOKEN=t >/dev/null; grep -c . "$T/curl.log")"
+OUT="$(arm APPROVAL_MERGE_TOKEN=t CI_MERGE_REQUEST_IID=5)"
+check "arm PUTs the MR merge endpoint"           1 "$(grep -c 'PUT .*/projects/7/merge_requests/5/merge' "$T/curl.log")"
+check "arm pins the commit"                      1 "$(grep -c 'sha=abcdef1234567890' "$T/curl.log")"
+check "arm asks for merge-when-pipeline-succeeds" 1 "$(grep -c 'merge_when_pipeline_succeeds=true' "$T/curl.log")"
+check "arm reports success"                      1 "$(echo "$OUT" | grep -c 'will merge when its pipeline succeeds')"
+check "arm treats a 409 as soft"                 0 "$(arm APPROVAL_MERGE_TOKEN=t CI_MERGE_REQUEST_IID=5 CURL_CODE=409 >/dev/null; echo $?)"
+check "arm explains a 403"                       1 "$(arm APPROVAL_MERGE_TOKEN=t CI_MERGE_REQUEST_IID=5 CURL_CODE=403 | grep -c 'Developer')"
+
 if [ "$FAILS" -ne 0 ]; then echo "$FAILS failed"; exit 1; fi
 echo "all passed"
