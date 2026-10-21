@@ -17,6 +17,21 @@
 # UBIXVAULT_CI_TOKEN_PROD (masked GitLab variables). The phpunit job reads its
 # MariaDB credentials from secret/ubixcore/test-db the same way.
 
+# Kelpie's advisory AI review on merge requests (job `kelpie-review`, stage `test`).
+# Pinned to a ubixkelpie commit, not a branch, so its job cannot change this CI unreviewed;
+# bump the ref on purpose. Move it to a release tag once one carries ci/kelpie.yml
+# (v0.1.0-beta.1 predates it). Needs group variables OPENROUTER_API_KEY,
+# AI_REVIEW_GITLAB_TOKEN and KELPIE_REGISTRY_USER / KELPIE_REGISTRY_TOKEN (read_registry,
+# to pull Kelpie's image); until they exist the job exits 75, is allowed to fail and the
+# pipeline stays green. Kelpie's job reviews only MRs into AI_REVIEW_BASE_BRANCH.
+include:
+  - project: ubixsys/ubixkelpie
+    ref: 788c9416214a6bdf4ceaffd851eaf34ac7850a38
+    file: ci/kelpie.yml
+
+variables:
+  AI_REVIEW_BASE_BRANCH: main
+
 default:
   retry:
     max: 2
