@@ -31,7 +31,9 @@ if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
 fi
 
 API="${CI_API_V4_URL:-}"; PROJECT="${CI_PROJECT_ID:-}"
-[ -n "$API" ] && [ -n "$PROJECT" ] || { echo "require-approval: CI_API_V4_URL and CI_PROJECT_ID are not set (run it in a GitLab job)"; exit 1; }
+if [ -z "$API" ] || [ -z "$PROJECT" ]; then
+  echo "require-approval: CI_API_V4_URL and CI_PROJECT_ID are not set (run it in a GitLab job)"; exit 1
+fi
 
 get() { curl --fail --silent --show-error --max-time 20 --header "PRIVATE-TOKEN: $TOKEN" "$API/projects/$PROJECT/$1"; }
 

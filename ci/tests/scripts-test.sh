@@ -135,8 +135,9 @@ awk '/^  script:/ { s = 1; next } s && /^    - \|/ { b = 1; next } b { sub(/^   
 fixture() { # fixture <author> <target> <approvers,comma> <thumbsup,comma>
     printf '{"iid":5,"target_branch":"%s","author":{"username":"%s"}}' "$2" "$1" > "$FIX/mr.json"
     printf '[{"iid":5}]' > "$FIX/list.json"
-    jq -cn --arg a "$3" '{approved_by: ($a | split(",") | map(select(. != "")) | map({user: {username: .}}))}' > "$FIX/approvals.json"
-    jq -cn --arg a "$4" '($a | split(",") | map(select(. != "")) | map({name: "thumbsup", user: {username: .}}))' > "$FIX/awards.json"
+    json_users() { local u out="" sep=""; for u in ${1//,/ }; do out="$out$sep${2//USER/$u}"; sep=","; done; printf '%s' "$out"; }
+    printf '{"approved_by":[%s]}' "$(json_users "$3" '{"user":{"username":"USER"}}')" > "$FIX/approvals.json"
+    printf '[%s]' "$(json_users "$4" '{"name":"thumbsup","user":{"username":"USER"}}')" > "$FIX/awards.json"
 }
 gate() { : > "$T/curl.log"; env -i PATH="$T/fakebin:$PATH" TMPDIR="$T" FIX="$FIX" CURL_LOG="$T/curl.log" \
     CI_API_V4_URL=https://gl/api/v4 CI_PROJECT_ID=7 CI_DEFAULT_BRANCH=main CI_COMMIT_SHA=abcdef12 \
