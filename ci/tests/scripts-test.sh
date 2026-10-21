@@ -74,6 +74,7 @@ reset_bump() {
     printf 'include:\n  - project: ubixsys/ubixcore\n    ref: v0.47.0   # ubixcore-ref: pin\n' > "$B/skeleton/.gitlab-ci.yml"
     printf '```yaml\n    ref: v0.47.0\n```\n' > "$B/skeleton/docs/ci-setup.md"
     printf '      ref: v0.47.0\n' > "$B/ci/README.md"
+    mkdir -p "$B/docs"; printf '    ref: v0.47.0\n' > "$B/docs/ci-require-approval.md"
 }
 bump() { UBIX_PROJECT_DIR="$B" bash "$BIN/bump-skeleton-ref.sh" --local "$1"; }
 reset_bump
@@ -81,6 +82,7 @@ check "bump rewrites to a newer tag"             bumped "$(bump v0.48.0)"
 check "bump updates the skeleton pipeline"       1 "$(grep -c 'ref: v0.48.0   # ubixcore-ref' "$B/skeleton/.gitlab-ci.yml")"
 check "bump updates ci-setup.md"                 1 "$(grep -c 'ref: v0.48.0' "$B/skeleton/docs/ci-setup.md")"
 check "bump updates ci/README.md"                1 "$(grep -c 'ref: v0.48.0' "$B/ci/README.md")"
+check "bump updates ci-require-approval.md"      1 "$(grep -c 'ref: v0.48.0' "$B/docs/ci-require-approval.md")"
 check "bump of the current tag is a no-op"       current "$(bump v0.48.0)"
 check "bump never downgrades"                    lower "$(bump v0.47.9)"
 check "bump compares versions numerically"       bumped "$(bump v0.100.0)"
@@ -107,6 +109,82 @@ check "arm asks for merge-when-pipeline-succeeds" 1 "$(grep -c 'merge_when_pipel
 check "arm reports success"                      1 "$(echo "$OUT" | grep -c 'will merge when its pipeline succeeds')"
 check "arm treats a 409 as soft"                 0 "$(arm APPROVAL_MERGE_TOKEN=t CI_MERGE_REQUEST_IID=5 CURL_CODE=409 >/dev/null; echo $?)"
 check "arm explains a 403"                       1 "$(arm APPROVAL_MERGE_TOKEN=t CI_MERGE_REQUEST_IID=5 CURL_CODE=403 | grep -c 'Developer')"
+
+# --- require-approval.sh / ci/require-approval.yml against a fake curl -------------
+check "yml carries the current require-approval.sh" 0 "$(bash "$BIN/inline-require-approval.sh" --check >/dev/null; echo $?)"
+FIX="$T/fix"; mkdir -p "$FIX"
+cat > "$T/fakebin/curl" <<'EOF2'
+#!/usr/bin/env bash
+echo "curl $*" >> "$CURL_LOG"
+url="${*: -1}"; method=GET
+for a in "$@"; do [ "$a" = PUT ] && method=PUT; done
+if [ "$method" = PUT ]; then printf '%s' "${CURL_CODE:-200}"; exit 0; fi
+[ -z "${CURL_FAIL:-}" ] || exit 22
+case "$url" in
+  *award_emoji) cat "$FIX/awards.json" ;;
+  *approvals)   cat "$FIX/approvals.json" ;;
+  *source_branch=*) cat "$FIX/list.json" ;;
+  *) cat "$FIX/mr.json" ;;
+esac
+EOF2
+chmod +x "$T/fakebin/curl"
+# the job's own script block, as the runner would receive it
+ROOT_YML="$PWD/ci/require-approval.yml"
+awk '/^  script:/ { s = 1; next } s && /^    - \|/ { b = 1; next } b { sub(/^      /, ""); print }' "$ROOT_YML" > "$T/job.sh" 2>/dev/null
+
+fixture() { # fixture <author> <target> <approvers,comma> <thumbsup,comma>
+    printf '{"iid":5,"target_branch":"%s","author":{"username":"%s"}}' "$2" "$1" > "$FIX/mr.json"
+    printf '[{"iid":5}]' > "$FIX/list.json"
+    jq -cn --arg a "$3" '{approved_by: ($a | split(",") | map(select(. != "")) | map({user: {username: .}}))}' > "$FIX/approvals.json"
+    jq -cn --arg a "$4" '($a | split(",") | map(select(. != "")) | map({name: "thumbsup", user: {username: .}}))' > "$FIX/awards.json"
+}
+gate() { : > "$T/curl.log"; env -i PATH="$T/fakebin:$PATH" TMPDIR="$T" FIX="$FIX" CURL_LOG="$T/curl.log" \
+    CI_API_V4_URL=https://gl/api/v4 CI_PROJECT_ID=7 CI_DEFAULT_BRANCH=main CI_COMMIT_SHA=abcdef12 \
+    CI_MERGE_REQUEST_IID=5 UBIX_APPROVAL_OWNERS=cwolsen APPROVAL_GITLAB_TOKEN=t "$@" sh "$T/job.sh" 2>&1; }
+verdict() { gate "$@" > "$T/gate.out"; echo $?; }
+has() { grep -c -- "$1" "$T/gate.out"; }
+
+fixture alice main "" ""
+check "no sign-off fails"                        1 "$(verdict)"
+check "no sign-off says so"                      1 "$(has 'no sign-off yet')"
+fixture alice main "bob" ""
+check "another user's approve passes"            0 "$(verdict)"
+fixture alice main "" "bob"
+check "another user's thumbs-up passes"          0 "$(verdict)"
+fixture cwolsen main "cwolsen" ""
+check "owner self-approve passes"                0 "$(verdict)"
+check "owner self-approve is logged"             1 "$(has 'SELF SIGN-OFF')"
+fixture alice main "alice" ""
+check "non-owner self-approve fails"             1 "$(verdict)"
+fixture cwolsen main "" "cwolsen"
+check "owner self thumbs-up passes"              0 "$(verdict)"
+fixture alice dev "" ""
+check "MR to an unguarded branch passes"         0 "$(verdict)"
+check "MR to an unguarded branch is noted"       1 "$(has 'not the guarded branch')"
+check "UBIX_APPROVAL_BRANCH guards another one"  1 "$(verdict UBIX_APPROVAL_BRANCH=dev)"
+fixture alice main "" ""
+check "no owners configured fails"               1 "$(verdict UBIX_APPROVAL_OWNERS=)"
+check "MERGE_APPROVAL_OWNERS is accepted"        0 "$(fixture cwolsen main cwolsen ""; verdict UBIX_APPROVAL_OWNERS= MERGE_APPROVAL_OWNERS=a,cwolsen)"
+fixture alice main "" ""
+check "no token is UNVERIFIED, passes"           0 "$(verdict APPROVAL_GITLAB_TOKEN=)"
+check "no token says UNVERIFIED"                 1 "$(has UNVERIFIED)"
+fixture alice main "" ""
+check "AI_REVIEW_GITLAB_TOKEN is the fallback"   1 "$(verdict APPROVAL_GITLAB_TOKEN= AI_REVIEW_GITLAB_TOKEN=x)"
+check "GitLab failure is UNVERIFIED, passes"     0 "$(verdict CURL_FAIL=1)"
+check "branch pipeline finds the MR by branch"   0 "$(fixture alice main bob ""; verdict CI_MERGE_REQUEST_IID= CI_COMMIT_BRANCH=feat/x)"
+check "branch lookup queries the source branch"  1 "$(grep -c 'source_branch=feat/x' "$T/curl.log")"
+printf '[]' > "$FIX/list.json"
+check "branch with no open MR fails"             1 "$(verdict CI_MERGE_REQUEST_IID= CI_COMMIT_BRANCH=feat/x)"
+fixture alice main bob ""
+check "no arm unless asked"                      0 "$(verdict >/dev/null; grep -c PUT "$T/curl.log")"
+verdict UBIX_APPROVAL_ARMS_MERGE=true APPROVAL_MERGE_TOKEN=m >/dev/null
+check "arm PUTs the merge pinned to the commit"  1 "$(grep -c 'PUT.*sha=abcdef12.*merge_requests/5/merge' "$T/curl.log")"
+verdict UBIX_APPROVAL_ARMS_MERGE=true >/dev/null
+check "arm without its token never PUTs"         0 "$(grep -c PUT "$T/curl.log")"
+check "arm failure is soft"                      0 "$(verdict UBIX_APPROVAL_ARMS_MERGE=true APPROVAL_MERGE_TOKEN=m CURL_CODE=409)"
+fixture alice main "" ""
+verdict UBIX_APPROVAL_ARMS_MERGE=true APPROVAL_MERGE_TOKEN=m >/dev/null
+check "no sign-off never arms"                   0 "$(grep -c PUT "$T/curl.log")"
 
 if [ "$FAILS" -ne 0 ]; then echo "$FAILS failed"; exit 1; fi
 echo "all passed"

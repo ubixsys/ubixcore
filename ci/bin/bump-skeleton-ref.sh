@@ -6,7 +6,7 @@
 #   bump-skeleton-ref.sh --local vX.Y.Z      only rewrite the files under UBIX_PROJECT_DIR
 #                                            (default: the repo root); no git, no API
 #
-# Rewrites `ref: vN.N.N` in skeleton/.gitlab-ci.yml, skeleton/docs/ci-setup.md and
+# Rewrites `ref: vN.N.N` in skeleton/.gitlab-ci.yml, skeleton/docs/ci-setup.md, docs/ci-require-approval.md and
 # ci/README.md, commits that on branch ci/bump-skeleton-ref-<tag> cut from the
 # remote's main, and opens a merge request to main. main is MR-only and every merge
 # needs the owner's sign-off, so the bot never pushes to main and never approves.
@@ -29,7 +29,7 @@ if ! [[ "$TAG" =~ $SEMVER ]]; then
 fi
 
 ROOT="${UBIX_PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
-FILES=(skeleton/.gitlab-ci.yml skeleton/docs/ci-setup.md ci/README.md)
+FILES=(skeleton/.gitlab-ci.yml skeleton/docs/ci-setup.md ci/README.md docs/ci-require-approval.md)
 REF_RE='^([[:space:]]*ref: )(v[0-9]+\.[0-9]+\.[0-9]+)'
 
 # Rewrite the files under $ROOT; prints "current", "lower" or "bumped".

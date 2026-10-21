@@ -1,0 +1,120 @@
+# Merge sign-off gate as a standalone include: one job, no Docker, no PHP, no other uBixCore
+# pieces, so plain sites, Go, PHP and minimal CI files can all use it.
+#
+#   include:
+#     - project: ubixsys/ubixcore
+#       ref: v0.47.0
+#       file: ci/require-approval.yml
+#   variables:
+#     UBIX_APPROVAL_OWNERS: "cwolsen"
+#
+# Docs: docs/ci-require-approval.md. Do not include it next to ci/ubixcore-pipeline.yml,
+# whose require-approval-mr is the same gate. The script below is generated from
+# ci/bin/require-approval.sh (ci/bin/inline-require-approval.sh); edit that, not this.
+variables:
+  UBIX_APPROVAL_OWNERS: ""         # usernames whose Approve/👍 counts (comma-separated); required
+  UBIX_APPROVAL_BRANCH: ""         # branch whose MRs are guarded; empty = the default branch
+  UBIX_APPROVAL_ARMS_MERGE: "false" # "true": a verified sign-off arms merge-when-pipeline-succeeds (APPROVAL_MERGE_TOKEN)
+  UBIX_APPROVAL_IMAGE: alpine:3    # ignored by shell runners; needs curl and jq (installed if missing)
+
+# .post always exists, so the include works whatever `stages:` the repo declares, and it runs
+# last: a red verdict neither hides nor holds up the real checks. GitLab does not re-run a
+# pipeline on approval: approve, then retry this job. Agents never approve.
+require-approval:
+  stage: .post
+  image: $UBIX_APPROVAL_IMAGE
+  timeout: 5 minutes
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE != "merge_request_event"
+  script:
+    - |
+      command -v bash >/dev/null 2>&1 || apk add --no-cache bash >/dev/null
+      SCRIPT="$(mktemp)"
+      cat > "$SCRIPT" <<'UBIX_REQUIRE_APPROVAL_EOF'
+      # >>> inlined from ci/bin/require-approval.sh
+      # require-approval.sh — the merge sign-off gate for repos that do not run uBixCore's PHP.
+      # Port of `bin/ubix ci:requireApproval` (Ubix\Service\Ci\MergeApprovalService). Needs only
+      # bash, curl and jq. Inlined into ci/require-approval.yml by ci/bin/inline-require-approval.sh:
+      # edit this file, never the copy in the yml. Spec: docs/ci-require-approval.md.
+      #
+      # Passes when the merge request has an Approve or a 👍 from someone other than its author,
+      # or from its author when listed in UBIX_APPROVAL_OWNERS (the log says SELF SIGN-OFF).
+      # Fails otherwise. Fails open (UNVERIFIED, exit 0) with no token or when GitLab is unreachable.
+      #
+      # Env: UBIX_APPROVAL_OWNERS (or MERGE_APPROVAL_OWNERS), APPROVAL_GITLAB_TOKEN (or
+      # AI_REVIEW_GITLAB_TOKEN), UBIX_APPROVAL_BRANCH (default CI_DEFAULT_BRANCH),
+      # UBIX_APPROVAL_ARMS_MERGE + APPROVAL_MERGE_TOKEN (optional), and from the pipeline
+      # CI_API_V4_URL, CI_PROJECT_ID, CI_COMMIT_BRANCH, CI_COMMIT_SHA, CI_MERGE_REQUEST_IID.
+      set -uo pipefail
+
+      unverified() { echo "UNVERIFIED -- $1; passing rather than blocking every merge."; exit 0; }
+
+      OWNERS="${UBIX_APPROVAL_OWNERS:-${MERGE_APPROVAL_OWNERS:-}}"
+      if [ -z "$OWNERS" ]; then
+        echo "require-approval: set UBIX_APPROVAL_OWNERS to the usernames whose Approve/👍 counts"; exit 1
+      fi
+      TOKEN="${APPROVAL_GITLAB_TOKEN:-${AI_REVIEW_GITLAB_TOKEN:-}}"
+      [ -n "$TOKEN" ] || unverified "no APPROVAL_GITLAB_TOKEN"
+
+      if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+        if command -v apk >/dev/null 2>&1; then apk add --no-cache curl jq >/dev/null 2>&1
+        elif command -v apt-get >/dev/null 2>&1; then apt-get update -qq >/dev/null 2>&1 && apt-get install -y -qq curl jq >/dev/null 2>&1
+        fi
+        if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then echo "require-approval: needs curl and jq on the runner"; exit 1; fi
+      fi
+
+      API="${CI_API_V4_URL:-}"; PROJECT="${CI_PROJECT_ID:-}"
+      [ -n "$API" ] && [ -n "$PROJECT" ] || { echo "require-approval: CI_API_V4_URL and CI_PROJECT_ID are not set (run it in a GitLab job)"; exit 1; }
+
+      get() { curl --fail --silent --show-error --max-time 20 --header "PRIVATE-TOKEN: $TOKEN" "$API/projects/$PROJECT/$1"; }
+
+      IID="${CI_MERGE_REQUEST_IID:-}"
+      if [ -z "$IID" ]; then
+        LIST="$(get "merge_requests?state=opened&source_branch=${CI_COMMIT_BRANCH:-}")" || unverified "GitLab unreachable or refused the token"
+        IID="$(jq -r '.[0].iid // empty' <<<"$LIST")" || unverified "unreadable merge request list"
+        [ -n "$IID" ] || { echo "No open merge request for this branch; nothing to sign off yet."; exit 1; }
+      fi
+
+      MR="$(get "merge_requests/$IID")" || unverified "GitLab unreachable or refused the token"
+      APPROVALS="$(get "merge_requests/$IID/approvals")" || unverified "GitLab unreachable or refused the token"
+      AWARDS="$(get "merge_requests/$IID/award_emoji")" || unverified "GitLab unreachable or refused the token"
+
+      GUARDED="${UBIX_APPROVAL_BRANCH:-${CI_DEFAULT_BRANCH:-}}"
+      TARGET="$(jq -r '.target_branch // empty' <<<"$MR")" || unverified "unreadable merge request"
+      if [ -n "$GUARDED" ] && [ "$TARGET" != "$GUARDED" ]; then
+        echo "!$IID targets '$TARGET', not the guarded branch '$GUARDED'; no sign-off needed."; exit 0
+      fi
+
+      AUTHOR="$(jq -r '.author.username // empty' <<<"$MR")" || unverified "unreadable merge request"
+      PEOPLE="$( { jq -r '.approved_by[]?.user.username // empty' <<<"$APPROVALS"
+                   jq -r '.[]? | select(.name == "thumbsup") | .user.username // empty' <<<"$AWARDS"; } | sort -u)" \
+        || unverified "unreadable approvals"
+      OTHERS="$(grep -vxF -- "$AUTHOR" <<<"$PEOPLE" | grep -v '^$' || true)"
+      IS_OWNER=0; case ",$(tr -d ' ' <<<"$OWNERS")," in *",$AUTHOR,"*) IS_OWNER=1 ;; esac
+      SELF=0; if [ -z "$OTHERS" ] && [ -n "$AUTHOR" ] && grep -qxF -- "$AUTHOR" <<<"$PEOPLE" && [ "$IS_OWNER" = 1 ]; then SELF=1; fi
+
+      if [ -z "$OTHERS" ] && [ "$SELF" = 0 ]; then
+        echo "!$IID has no sign-off yet. Approve it (or give it a thumbs-up), then retry this job."; exit 1
+      fi
+      [ "$SELF" = 1 ] && echo "SELF SIGN-OFF: $AUTHOR approved their own !$IID (listed in UBIX_APPROVAL_OWNERS)."
+      echo "!$IID signed off by $(paste -sd, - <<<"$PEOPLE" | sed 's/,/, /g')."
+
+      # Opt-in: a verified sign-off arms merge-when-pipeline-succeeds, pinned to this commit.
+      # Soft: any problem is a message, never a failure (the person can still merge by hand).
+      if [ "${UBIX_APPROVAL_ARMS_MERGE:-false}" = "true" ]; then
+        if [ -z "${APPROVAL_MERGE_TOKEN:-}" ]; then echo "arm-merge: no APPROVAL_MERGE_TOKEN; merge not armed (merge by hand)"; exit 0; fi
+        CODE="$(curl --silent --show-error --max-time 20 --output /dev/null --write-out '%{http_code}' --request PUT \
+          --header "PRIVATE-TOKEN: $APPROVAL_MERGE_TOKEN" \
+          --data-urlencode "sha=${CI_COMMIT_SHA:-}" --data-urlencode "merge_when_pipeline_succeeds=true" \
+          --data-urlencode "should_remove_source_branch=true" \
+          "$API/projects/$PROJECT/merge_requests/$IID/merge")" || CODE=000
+        case "$CODE" in
+          200) echo "arm-merge: !$IID will merge when its pipeline succeeds" ;;
+          *) echo "arm-merge: HTTP $CODE; merge not armed (merge by hand)" ;;
+        esac
+      fi
+      exit 0
+      # <<< end inlined
+      UBIX_REQUIRE_APPROVAL_EOF
+      bash "$SCRIPT"
