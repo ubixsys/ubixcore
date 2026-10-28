@@ -81,8 +81,9 @@ build-test-image:
       # Pin the floating base by digest for this build; the digest also keys the
       # extension layer's cache (see Dockerfile_Test).
       BASE_REF="$(sed -n 's/^ARG BASE_IMAGE=//p' Dockerfile_Test)"
-      BASE_DIGEST="$(docker buildx imagetools inspect "$BASE_REF" --format '{{.Manifest.Digest}}')"
-      case "$BASE_DIGEST" in sha256:*) ;; *) echo "cannot resolve digest of $BASE_REF"; exit 1 ;; esac
+      INSPECT="$(docker buildx imagetools inspect "$BASE_REF" 2>&1)" || { echo "$INSPECT"; exit 1; }
+      BASE_DIGEST="$(printf '%s\n' "$INSPECT" | sed -n 's/^Digest:[[:space:]]*//p' | head -n1)"
+      case "$BASE_DIGEST" in sha256:*) ;; *) echo "cannot resolve digest of $BASE_REF:"; echo "$INSPECT"; exit 1 ;; esac
       echo "base ${BASE_REF} -> ${BASE_DIGEST}"
       docker buildx build --pull --provenance=false --sbom=false --platform linux/amd64 --push \
         --build-arg "BASE_IMAGE=${BASE_REF%%:dev}@${BASE_DIGEST}" --build-arg "BASE_DIGEST=${BASE_DIGEST}" \
