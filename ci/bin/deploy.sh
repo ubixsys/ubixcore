@@ -10,7 +10,8 @@
 #   <env>-service.yaml     applied if present
 #   <env>-ingress.yaml     applied if present
 #   <env>-worker*.yaml     each applied with {{DATE_STAMP}} replaced, like the deploy; then
-#                          `rollout status` is awaited for each
+#                          `rollout status` is awaited for each Deployment, StatefulSet or
+#                          DaemonSet (a file of another kind is applied, not awaited)
 #   <env>-cronjob*.yaml    each applied (no rollout to wait for)
 #
 # An app directory with none of these is skipped. Secrets are never applied from here:
@@ -111,6 +112,11 @@ for dir in "$PROJECT_DIR"/app/*/; do
             for f in "${workers[@]}"; do
                 [ -f "$f" ] || continue
                 rendered="$TMP/$app-$(basename "$f")"
+                # `rollout status` only understands Deployment, StatefulSet and DaemonSet.
+                if ! grep -qE '^kind:[[:space:]]*(Deployment|StatefulSet|DaemonSet)[[:space:]]*$' "$rendered"; then
+                    echo "[$app] $(basename "$f") has no rollout-able kind: not waiting"
+                    continue
+                fi
                 echo "[$app] waiting for $(basename "$f") rollout (timeout $ROLLOUT_TIMEOUT)"
                 if ! kube "$target" rollout status -f "$rendered" --timeout="$ROLLOUT_TIMEOUT"; then
                     echo "[$app] $(basename "$f") rollout did not complete on '$target'" >&2
