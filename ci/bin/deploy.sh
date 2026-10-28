@@ -113,7 +113,10 @@ for dir in "$PROJECT_DIR"/app/*/; do
                 [ -f "$f" ] || continue
                 rendered="$TMP/$app-$(basename "$f")"
                 # `rollout status` only understands Deployment, StatefulSet and DaemonSet.
-                if ! grep -qE '^kind:[[:space:]]*(Deployment|StatefulSet|DaemonSet)[[:space:]]*$' "$rendered"; then
+                # Tolerates CRLF, quotes and a trailing comment; a file with no readable kind
+                # is awaited anyway, so a miss fails loudly instead of passing a bad rollout.
+                kinds="$(tr -d '\r' < "$rendered" | sed -nE "s/^kind:[[:space:]]*[\"']?([A-Za-z]+).*/\1/p")"
+                if [ -n "$kinds" ] && ! grep -qxE 'Deployment|StatefulSet|DaemonSet' <<<"$kinds"; then
                     echo "[$app] $(basename "$f") has no rollout-able kind: not waiting"
                     continue
                 fi
