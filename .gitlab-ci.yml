@@ -78,7 +78,19 @@ build-test-image:
   script:
     - |
       set -euo pipefail
-      docker buildx build --provenance=false --sbom=false --platform linux/amd64 --push \
+      # Resolve the floating base to a digest once per build and build FROM that digest, so
+      # the base cannot move mid-build. It is resolved per pipeline, not committed: the digest
+      # is recorded on the pushed image (org.opencontainers.image.base.*) so any test image
+      # can be tied to the base it used, and it keys the extension layer's cache
+      # (see Dockerfile_Test).
+      BASE_REF="$(sed -n 's/^ARG BASE_IMAGE=//p' Dockerfile_Test)"
+      INSPECT="$(docker buildx imagetools inspect "$BASE_REF" 2>&1)" || { echo "$INSPECT"; exit 1; }
+      BASE_DIGEST="$(printf '%s\n' "$INSPECT" | sed -n 's/^Digest:[[:space:]]*//p' | head -n1)"
+      case "$BASE_DIGEST" in sha256:*) ;; *) echo "cannot resolve digest of $BASE_REF:"; echo "$INSPECT"; exit 1 ;; esac
+      echo "base ${BASE_REF} -> ${BASE_DIGEST}"
+      docker buildx build --pull --provenance=false --sbom=false --platform linux/amd64 --push \
+        --build-arg "BASE_IMAGE=${BASE_REF%%:dev}@${BASE_DIGEST}" --build-arg "BASE_DIGEST=${BASE_DIGEST}" \
+        --label "org.opencontainers.image.base.name=${BASE_REF}" --label "org.opencontainers.image.base.digest=${BASE_DIGEST}" \
         -t "${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHA}-test" -f Dockerfile_Test .
 
 # The uBixOps image (Dockerfile_Ops) is published from GitHub on a tag, so this is the
