@@ -68,6 +68,29 @@ rm "$T/proj/app/WebApi/"dev-* "$T/proj/app/Worker/"dev-*
 run_deploy; RC=$?
 check "nothing to deploy is an error"            1 "$RC"
 
+# worker manifests: a worker-only app passes the gate; only rollout-able kinds are awaited
+mkdir -p "$T/proj/app/Queue"
+printf 'kind: Deployment\nstamp: "{{DATE_STAMP}}"\n' > "$T/proj/app/Queue/dev-worker.yaml"
+run_deploy; RC=$?
+check "worker-only app deploys"                  0 "$RC"
+check "worker is rendered and applied"           1 "$(grep -c 'apply -f .*/Queue-dev-worker.yaml' "$T/kube.log")"
+check "worker rollout is awaited"                1 "$(grep -c 'rollout status -f .*/Queue-dev-worker.yaml' "$T/kube.log")"
+
+printf 'kind: Job\n' > "$T/proj/app/Queue/dev-worker-job.yaml"
+run_deploy; RC=$?
+check "Job worker deploys"                       0 "$RC"
+check "Job worker is applied"                    1 "$(grep -c 'apply -f .*/Queue-dev-worker-job.yaml' "$T/kube.log")"
+check "Job worker is not awaited"                1 "$(grep -c 'rollout status' "$T/kube.log")"
+
+run_deploy KUBE_FAIL_ROLLOUT=1; RC=$?
+check "failed worker rollout fails the deploy"   1 "$RC"
+
+rm "$T/proj/app/Queue/dev-worker-job.yaml"
+printf 'kind: "Deployment"  # worker\r\n' > "$T/proj/app/Queue/dev-worker.yaml"
+run_deploy; RC=$?
+check "quoted CRLF commented kind still waits"   1 "$(grep -c 'rollout status' "$T/kube.log")"
+rm -r "$T/proj/app/Queue"
+
 # --- bump-skeleton-ref.sh --local -------------------------------------------------
 B="$T/bump"; mkdir -p "$B/skeleton/docs" "$B/ci"
 reset_bump() {
