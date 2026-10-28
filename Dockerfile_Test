@@ -2,15 +2,26 @@
 # stage (amd64, never deployed). uBixCore is a Composer package, not a service,
 # so there is no runtime image here; host projects build their own from the
 # skeleton's Dockerfile.
-FROM gitlab.brainchurts.com:5050/k8s/baseimages/nginx-php85-fpm-memcache:dev
+#
+# CI resolves the base's current digest and passes both args, so the base is pinned
+# for the build and the digest is part of the extension layer's cache key (a changed
+# base can never reuse an apk layer built against the previous one). A bare
+# `docker build` still works and just follows the floating tag.
+ARG BASE_IMAGE=gitlab.brainchurts.com:5050/k8s/baseimages/nginx-php85-fpm-memcache:dev
+FROM ${BASE_IMAGE}
+ARG BASE_DIGEST=unpinned
 
 USER root
 # git: composer; pcntl/posix: phpunit time limits + posix_kill teardown;
 # mariadb-client: `bin/ubix database:resetSchema` shells out to `mysql`.
-RUN apk add --no-cache git php85-pcntl php85-posix mariadb-client && \
+RUN echo "base: ${BASE_DIGEST}" && \
+    apk add --no-cache git php85-pcntl php85-posix mariadb-client && \
     # the unit-test MariaDB has no TLS; Alpine's mariadb client insists on it by default
     printf '[client]\nskip-ssl\n' > /etc/my.cnf.d/99-skip-ssl.cnf && \
-    mkdir -p /web && chown -R www:www /web
+    mkdir -p /web && chown -R www:www /web && \
+    # fail the build, not phpunit, if the extensions do not load against this base
+    ! php -v 2>&1 | grep -qi 'warning' && \
+    php -m | grep -qx pcntl && php -m | grep -qx posix
 
 USER www
 WORKDIR /web
