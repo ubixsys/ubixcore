@@ -9,6 +9,8 @@
 #                          image tag still rolls; then `rollout status` is awaited
 #   <env>-service.yaml     applied if present
 #   <env>-ingress.yaml     applied if present
+#   <env>-worker*.yaml     each applied with {{DATE_STAMP}} replaced, like the deploy; then
+#                          `rollout status` is awaited for each
 #   <env>-cronjob*.yaml    each applied (no rollout to wait for)
 #
 # An app directory with none of these is skipped. Secrets are never applied from here:
@@ -70,7 +72,8 @@ for dir in "$PROJECT_DIR"/app/*/; do
     app="$(basename "$dir")"
     deploy_file="$dir${ENVIRONMENT}-deploy.yaml"
     cronjobs=("$dir${ENVIRONMENT}"-cronjob*.yaml)
-    [ -f "$deploy_file" ] || [ -f "${cronjobs[0]}" ] || continue
+    workers=("$dir${ENVIRONMENT}"-worker*.yaml)
+    [ -f "$deploy_file" ] || [ -f "${cronjobs[0]}" ] || [ -f "${workers[0]}" ] || continue
 
     for target in "${TARGETS[@]}"; do
         if [ -f "$deploy_file" ]; then
@@ -83,6 +86,13 @@ for dir in "$PROJECT_DIR"/app/*/; do
                 if [ -f "$f" ]; then echo "[$app] apply $(basename "$f")"; kube "$target" apply -f "$f"; fi
             done
         fi
+        for f in "${workers[@]}"; do
+            [ -f "$f" ] || continue
+            rendered="$TMP/$app-$(basename "$f")"
+            sed "s/{{DATE_STAMP}}/${DATE_STAMP}/g" "$f" > "$rendered"
+            echo "[$app] apply $(basename "$f")"
+            kube "$target" apply -f "$rendered"
+        done
         for f in "${cronjobs[@]}"; do
             if [ -f "$f" ]; then echo "[$app] apply $(basename "$f")"; kube "$target" apply -f "$f"; fi
         done
@@ -97,13 +107,25 @@ for dir in "$PROJECT_DIR"/app/*/; do
                 exit 1
             fi
         fi
+        if [ "$ROLLOUT_TIMEOUT" != 0 ]; then
+            for f in "${workers[@]}"; do
+                [ -f "$f" ] || continue
+                rendered="$TMP/$app-$(basename "$f")"
+                echo "[$app] waiting for $(basename "$f") rollout (timeout $ROLLOUT_TIMEOUT)"
+                if ! kube "$target" rollout status -f "$rendered" --timeout="$ROLLOUT_TIMEOUT"; then
+                    echo "[$app] $(basename "$f") rollout did not complete on '$target'" >&2
+                    kube "$target" get -f "$rendered" -o wide >&2 || true
+                    exit 1
+                fi
+            done
+        fi
     done
     APPLIED=$((APPLIED + 1))
     echo "[$app] deployed"
 done
 
 if [ "$APPLIED" -eq 0 ]; then
-    echo "No app/*/${ENVIRONMENT}-deploy.yaml or ${ENVIRONMENT}-cronjob*.yaml found: nothing deployed." >&2
+    echo "No app/*/${ENVIRONMENT}-deploy.yaml, ${ENVIRONMENT}-worker*.yaml or ${ENVIRONMENT}-cronjob*.yaml found: nothing deployed." >&2
     exit 1
 fi
 echo "Deployed ${APPLIED} app(s) to ${ENVIRONMENT}."
