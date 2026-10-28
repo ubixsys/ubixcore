@@ -19,6 +19,13 @@ RUN echo "base: ${BASE_DIGEST}" && \
     # the unit-test MariaDB has no TLS; Alpine's mariadb client insists on it by default
     printf '[client]\nskip-ssl\n' > /etc/my.cnf.d/99-skip-ssl.cnf && \
     mkdir -p /web && chown -R www:www /web && \
+    # show how this base's php is laid out, so a failing check below is readable
+    { echo '--- which php'; command -v php; echo '--- php -v'; php -v 2>&1; \
+      echo '--- php -m'; php -m 2>&1; echo '--- php --ini'; php --ini 2>&1; \
+      echo '--- extension-dir'; php-config --extension-dir 2>&1; php -r 'echo ini_get("extension_dir"), "\n";' 2>&1; \
+      echo '--- /etc/os-release'; head -n2 /etc/os-release; \
+      echo '--- extension files'; ls -la /usr/local/lib/php/extensions/*/ /usr/lib/php85/modules 2>&1; \
+      echo '--- ini files naming pcntl/posix'; grep -rl 'pcntl\|posix' /usr/local/etc/php /etc/php85 2>&1; true; } && \
     # fail the build, not phpunit, if the extensions do not load against this base
     ! php -v 2>&1 | grep -qi 'warning' && \
     php -m | grep -qx pcntl && php -m | grep -qx posix
