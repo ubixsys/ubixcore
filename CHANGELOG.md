@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Database
+
+- New: optional `MYSQL_TIME_ZONE`. When set, every new MySQL connection (read, write and
+  migration) runs `SET time_zone = ?` with the value bound. Accepts `SYSTEM`, an offset such
+  as `+00:00`, or a named zone. Unset, behaviour is unchanged. A malformed value, or one the
+  server refuses, fails loudly with an error naming `MYSQL_TIME_ZONE`; named zones need the
+  server's time-zone tables loaded, so use `SYSTEM` or an offset where they are not. See
+  `docs/standards/database.md` and `.env.example`.
+
 ### Docs
 
 - New: `docs/ci.md` — the CI pipeline doc (stages, jobs, the Kelpie include, and how

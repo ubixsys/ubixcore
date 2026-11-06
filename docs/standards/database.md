@@ -259,6 +259,7 @@ Before merging a new table, confirm:
 - [ ] Soft-FK column type matches the referenced `id` exactly.
 - [ ] Engine is `InnoDB`, charset is `utf8mb4`.
 - [ ] The connection speaks `utf8mb4` too (the default since v0.37; `MYSQL_CHARSET` overrides it). A `utf8mb4` table behind a `latin1` connection stores every non-ASCII character double-encoded.
+- [ ] If the app needs a fixed session time zone, set `MYSQL_TIME_ZONE` (since v0.48.0). Every new MySQL connection, read, write and migration, then runs `SET time_zone = ?` with the value bound. Unset, nothing is issued and the server's zone applies. It accepts `SYSTEM`, an offset such as `+00:00`, or a named zone such as `America/New_York`. **Named zones need the server's time-zone tables loaded** (`mysql_tzinfo_to_sql`); where they are not, every connection fails with an error naming `MYSQL_TIME_ZONE`, and there is no silent fallback. Use `SYSTEM` or an offset on such servers (an offset does not follow daylight saving time).
 - [ ] Every column has explicit `NULL` / `NOT NULL`.
 - [ ] Money columns are `DECIMAL`, not float.
 - [ ] If event-table archetype (§6.5): append-only writes; immutable post-insert (no UPDATE; DELETE only via retention purge); `event_timestamp NOT NULL DATETIME`; no JSON columns; stable monotonic `BIGINT UNSIGNED AUTO_INCREMENT` PK; retention policy documented in the surface's spec.
