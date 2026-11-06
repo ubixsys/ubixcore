@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Docs
+
+- New: `docs/ci.md` — the CI pipeline doc (stages, jobs, the Kelpie include, and how
+  host repos consume the shared `ci/ubixcore-pipeline.yml` template). Linked from
+  `README.md`.
+
 ## 0.47.0 - 2026-10-17
 
 ### CI template

@@ -71,6 +71,8 @@ framework and the npm package from this project's registries and subtree-splits
 `skeleton/` into `ubixsys/ubixcore-skeleton`. Hosts upgrade with
 `composer update ubixsys/ubixcore` and commit the lock.
 
+CI: [docs/ci.md](docs/ci.md) — stages, jobs, and the shared template hosts include.
+
 ## Coordination
 
 Several agent sessions may work this repo at once. Register a lane in `AGENTS-COORD.md`
