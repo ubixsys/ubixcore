@@ -275,27 +275,29 @@ final class VaultServiceTest extends UbixConcreteClassOrEnumTestCase implements 
     }
 
     /**
-     * A 2xx whose body is not a JSON object or array fails as a RuntimeException, keeping the cause
+     * A 2xx whose body is not a JSON object or array fails as a RuntimeException, and the body
+     * (which a truncated KV response could make a secret) appears nowhere in the exception chain
      *
-     * @param string $body The undecodable response body
+     * @param string $body  The undecodable response body
+     * @param string $cause The decode error's class, the only part of it that is kept
      *
      * @return void
      */
     #[DataProvider('undecodableBodies')]
-    public function testUndecodable2xxBodyThrowsRuntimeException(string $body): void
+    public function testUndecodable2xxBodyThrowsRuntimeException(string $body, string $cause): void
     {
         $logger = $this->createMock(Logger::class);
         $logger->expects($this->once())
             ->method('error')
-            ->with('uBix Vault response was not decodable JSON', ['method' => 'GET', 'path' => '/v1/secret/data/app/db', 'status' => 200]);
+            ->with('uBix Vault response was not decodable JSON', ['cause' => $cause, 'method' => 'GET', 'path' => '/v1/secret/data/app/db', 'status' => 200]);
 
         try {
             $this->service([new Response(200, ['Content-Type' => 'text/html'], $body)], $logger)
                 ->readKvV2Secret(self::VAULT_ADDRESS, self::TOKEN, 'app/db');
             $this->fail('Expected a RuntimeException for an undecodable body');
         } catch (RuntimeException $exception) {
-            $this->assertSame('uBix Vault request to `/v1/secret/data/app/db` returned a 200 whose body is not a JSON object or array', $exception->getMessage());
-            $this->assertNotNull($exception->getPrevious(), 'The decode error is kept as the previous exception');
+            $this->assertSame('uBix Vault request to `/v1/secret/data/app/db` returned a 200 whose body is not a JSON object or array (' . $cause . ')', $exception->getMessage());
+            $this->assertNull($exception->getPrevious(), 'The decode error carries the body, so it is not chained');
         }
     }
 
@@ -395,15 +397,15 @@ final class VaultServiceTest extends UbixConcreteClassOrEnumTestCase implements 
     /**
      * 2xx bodies that do not decode to a JSON object or array
      *
-     * @return array<string, array{0: string}>
+     * @return array<string, array{0: string, 1: string}>
      */
     public static function undecodableBodies(): array
     {
         return [
-            'html error page' => ['<html><body>502 Bad Gateway</body></html>'],
-            'json number'     => ['1'],
-            'json string'     => ['"ok"'],
-            'truncated json'  => ['{"data":{"data":'],
+            'html error page' => ['<html><body>502 Bad Gateway</body></html>', 'DtoException'],
+            'json number'     => ['1', 'TypeError'],
+            'json string'     => ['"ok"', 'TypeError'],
+            'truncated json'  => ['{"data":{"data":{"password":"s3cret"', 'DtoException'],
         ];
     }
 

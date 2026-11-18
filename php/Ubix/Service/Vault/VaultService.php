@@ -7,6 +7,7 @@ namespace Ubix\Service\Vault;
 use GuzzleHttp\ClientInterface as Client;
 use GuzzleHttp\Exception\GuzzleException;
 use Psr\Log\LoggerInterface as Logger;
+use ReflectionClass;
 use RuntimeException;
 use TypeError;
 use Ubix\Exception\DtoException;
@@ -249,11 +250,18 @@ final class VaultService
         //  a TypeError. Either would escape the RuntimeException contract every caller of
         //  this class relies on, e.g. an HTML error page served with a 200 by a proxy.
         //
+        //  The decode error is NOT chained as the previous exception: DtoException's
+        //  JsonError keeps the whole input, and a truncated KV response can hold secret
+        //  values, which anything that logs or renders the exception chain would print.
+        //  Only its class name is kept.
+        //
         try {
             return $this->jsonService->decode($body);
         } catch (DtoException | TypeError $exception) { // @phpstan-ignore catch.neverThrown (JsonService::decode() raises TypeError from its array return type for a scalar JSON body; PHPStan reads only its @throws)
-            $this->logger->error('uBix Vault response was not decodable JSON', ['method' => $method, 'path' => $path, 'status' => $response->getStatusCode()]);
-            throw new RuntimeException('uBix Vault request to `' . $path . '` returned a ' . $response->getStatusCode() . ' whose body is not a JSON object or array', 0, $exception);
+            $cause = (new ReflectionClass($exception))->getShortName();
+
+            $this->logger->error('uBix Vault response was not decodable JSON', ['cause' => $cause, 'method' => $method, 'path' => $path, 'status' => $response->getStatusCode()]);
+            throw new RuntimeException('uBix Vault request to `' . $path . '` returned a ' . $response->getStatusCode() . ' whose body is not a JSON object or array (' . $cause . ')');
         }
     }
 }
