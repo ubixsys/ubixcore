@@ -230,6 +230,75 @@ abstract class AbstractPdoSqlService implements SqlService
     }
 
     /**
+     * The session time zone a MySQL/MariaDB connection is put on: `MYSQL_TIME_ZONE`, default none
+     *
+     * Unset or empty leaves the server's own zone alone. Otherwise the value is
+     * `SYSTEM`, an offset such as `+00:00` (-13:59 to +14:00), or a named zone such
+     * as `America/New_York`. A named zone only works where the server has its
+     * time-zone tables loaded; `SYSTEM` and offsets always work.
+     *
+     * It is validated when the service is initialized (the constructor, or the
+     * first use for the lazily initialized migration service), and again as each
+     * connection is opened.
+     *
+     * @return ?string The zone to apply to each new connection, or null to leave the server default
+     *
+     * @throws InvalidArgumentException When `MYSQL_TIME_ZONE` is not a time zone name, `SYSTEM` or an offset
+     */
+    protected function connectionTimeZone(): ?string
+    {
+        $timeZone = trim((string) getenv('MYSQL_TIME_ZONE'));
+        if ($timeZone === '') {
+            return null;
+        }
+
+        if (preg_match('/^([+-])(\d{2}):(\d{2})$/', $timeZone, $offset) === 1) {
+            $minutes = ((int) $offset[2] * 60) + (int) $offset[3];
+            $valid   = (int) $offset[3] < 60 && ($offset[1] === '+' ? $minutes <= 14 * 60 : ($minutes <= (13 * 60) + 59 && $minutes > 0)); // MySQL takes -13:59 to +14:00 and refuses -00:00
+            if ($valid) {
+                return $timeZone;
+            }
+        } elseif (strtoupper($timeZone) === 'SYSTEM' || preg_match('/^[A-Za-z][A-Za-z0-9_+\/-]{0,63}$/', $timeZone) === 1) { // Bound, never interpolated, but a malformed value should fail here by name
+            return $timeZone;
+        }
+
+        throw new InvalidArgumentException(
+            'MYSQL_TIME_ZONE must be SYSTEM, an offset such as +00:00, or a time zone name such as America/New_York',
+            ExceptionCode::ERROR_CONNECTING_TO_PDO->value,
+        );
+    }
+
+    /**
+     * Put a new MySQL connection on `MYSQL_TIME_ZONE`, when one is set
+     *
+     * Runs `SET time_zone = ?` with the value bound. A failure is not swallowed:
+     * the usual cause is a named zone on a server without time-zone tables.
+     *
+     * @param PDO $pdo A freshly opened MySQL connection
+     *
+     * @throws DtoException When the server refuses the time zone
+     *
+     * @return void
+     */
+    protected function applyConnectionTimeZone(PDO $pdo): void
+    {
+        $timeZone = $this->connectionTimeZone();
+        if ($timeZone === null) {
+            return;
+        }
+
+        try {
+            $pdo->prepare('SET time_zone = ?')->execute([$timeZone]);
+        } catch (PDOException $e) {
+            throw new DtoException(
+                'MYSQL_TIME_ZONE "' . $timeZone . '" could not be applied to the database connection. Named time zones (such as America/New_York) need the server\'s time-zone tables loaded; use SYSTEM or an offset such as +00:00 where they are not.',
+                ExceptionCode::ERROR_CONNECTING_TO_PDO->value,
+                $this->pdoExceptionToDto($e),
+            );
+        }
+    }
+
+    /**
      * Initialize the readPdoConstructorParameter and writePdoConstructorParameter objects
      *
      * @param string             $readDsn       For reads: The Data Source Name, or DSN, contains the information required to connect to the database
@@ -253,6 +322,11 @@ abstract class AbstractPdoSqlService implements SqlService
         ?string $writePassword = null,
         ?array $writeOptions = null,
     ): void {
+        // Fail at initialization, not on the first query, when MYSQL_TIME_ZONE is malformed and a MySQL connection is configured
+        if (str_starts_with($readDsn, 'mysql:') || str_starts_with((string) $writeDsn, 'mysql:')) {
+            $this->connectionTimeZone();
+        }
+
         $readPdoConstructorParameters = new PdoConstructorParameters(
             dsn:      $readDsn,
             username: $readUsername,
@@ -271,6 +345,18 @@ abstract class AbstractPdoSqlService implements SqlService
     }
 
     /**
+     * Open a new PDO connection (a seam so tests can inject one)
+     *
+     * @param PdoConstructorParameters $parameters The connection parameters
+     *
+     * @return PDO A new, unconfigured connection
+     */
+    protected function openPdo(PdoConstructorParameters $parameters): PDO
+    {
+        return new PDO($parameters->dsn, $parameters->username, $parameters->password, $parameters->options);
+    }
+
+    /**
      * Get a PDO object
      *
      * @param bool $useWrite Whether or not to use the write PDO or the read PDO (optional) (default: false)
@@ -284,19 +370,22 @@ abstract class AbstractPdoSqlService implements SqlService
         $this->ensureInitialized();
 
         try {
-            $singletonKey = md5(serialize($useWrite ? $this->writePdoConstructorParameters : $this->readPdoConstructorParameters));
+            $parameters   = $useWrite ? $this->writePdoConstructorParameters : $this->readPdoConstructorParameters;
+            $timeZone     = str_starts_with($parameters->dsn, 'mysql:') ? $this->connectionTimeZone() : null; // The zone is part of the key: a connection already on another zone is never reused
+            $singletonKey = md5(serialize($parameters) . '|time_zone=' . ($timeZone ?? ''));
 
             if (!isset(self::$singletons[$singletonKey])) {
-                self::$singletons[$singletonKey] = new PDO(
-                    $useWrite ? $this->writePdoConstructorParameters->dsn : $this->readPdoConstructorParameters->dsn,
-                    $useWrite ? $this->writePdoConstructorParameters->username : $this->readPdoConstructorParameters->username,
-                    $useWrite ? $this->writePdoConstructorParameters->password : $this->readPdoConstructorParameters->password,
-                    $useWrite ? $this->writePdoConstructorParameters->options : $this->readPdoConstructorParameters->options,
-                );
+                $pdo = $this->openPdo($parameters);
 
-                self::$singletons[$singletonKey]->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-                self::$singletons[$singletonKey]->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
-                self::$singletons[$singletonKey]->setAttribute(PDO::ATTR_EMULATE_PREPARES, false);
+                $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+                $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
+                $pdo->setAttribute(PDO::ATTR_EMULATE_PREPARES, false);
+
+                if ($pdo->getAttribute(PDO::ATTR_DRIVER_NAME) === 'mysql') {
+                    $this->applyConnectionTimeZone($pdo); // Throws before the connection is cached, so a refused zone is never silently skipped
+                }
+
+                self::$singletons[$singletonKey] = $pdo;
             }
 
             return self::$singletons[$singletonKey];

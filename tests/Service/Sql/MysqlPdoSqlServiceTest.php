@@ -4,6 +4,17 @@ declare(strict_types=1);
 
 namespace Ubix\Tests\Service\Sql;
 
+use InvalidArgumentException;
+use PDO;
+use PDOException;
+use PDOStatement;
+use PHPUnit\Framework\Attributes\DataProvider;
+use Psr\Log\NullLogger;
+use ReflectionMethod;
+use stdClass;
+use Ubix\DataTransferObject\PdoConstructorParameters;
+use Ubix\Exception\DtoException;
+use Ubix\Service\Sql\AbstractPdoSqlService as PdoSqlService;
 use Ubix\Service\Sql\MysqlPdoSqlService;
 use Ubix\Tests\AbstractUbixConcreteClassOrEnumTestCase as UbixConcreteClassOrEnumTestCase;
 use Ubix\Tests\UbixConcreteClassOrEnumTestCaseInterface as IUbixConcreteClassOrEnumTestCase;
@@ -16,6 +27,194 @@ use Ubix\Tests\UbixConcreteClassOrEnumTestCaseInterface as IUbixConcreteClassOrE
 final class MysqlPdoSqlServiceTest extends UbixConcreteClassOrEnumTestCase implements IUbixConcreteClassOrEnumTestCase
 {
     /**
+     * Unset or blank MYSQL_TIME_ZONE means no time zone is applied
+     *
+     * @return void
+     */
+    public function testUnsetTimeZoneIsNull(): void
+    {
+        putenv('MYSQL_TIME_ZONE');
+        $this->assertNull($this->timeZone());
+
+        putenv('MYSQL_TIME_ZONE=  ');
+        $this->assertNull($this->timeZone());
+    }
+
+    /**
+     * SYSTEM, offsets and named zones are accepted as written
+     *
+     * @param string $value The MYSQL_TIME_ZONE value
+     *
+     * @return void
+     */
+    #[DataProvider('validTimeZones')]
+    public function testValidTimeZonesAreAccepted(string $value): void
+    {
+        putenv('MYSQL_TIME_ZONE=' . $value);
+        $this->assertSame($value, $this->timeZone());
+    }
+
+    /**
+     * Anything else is refused, naming MYSQL_TIME_ZONE
+     *
+     * @param string $value The MYSQL_TIME_ZONE value
+     *
+     * @return void
+     */
+    #[DataProvider('invalidTimeZones')]
+    public function testInvalidTimeZonesAreRefused(string $value): void
+    {
+        putenv('MYSQL_TIME_ZONE=' . $value);
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessageMatches('/MYSQL_TIME_ZONE/');
+        $this->timeZone();
+    }
+
+    /**
+     * With no time zone set, no SET is issued
+     *
+     * @return void
+     */
+    public function testNoSetIsIssuedWhenUnset(): void
+    {
+        putenv('MYSQL_TIME_ZONE');
+        $pdo = $this->createMock(PDO::class);
+        $pdo->expects($this->never())->method('prepare');
+
+        $this->apply($pdo);
+    }
+
+    /**
+     * A set value is bound (not interpolated) into SET time_zone on every connection it is applied to, read and write alike
+     *
+     * @return void
+     */
+    public function testTimeZoneIsBoundOnEveryConnection(): void
+    {
+        putenv('MYSQL_TIME_ZONE=+00:00');
+
+        for ($connection = 0; $connection < 2; $connection++) { // Once for the read connection, once for the write connection
+            $statement = $this->createMock(PDOStatement::class);
+            $statement->expects($this->once())->method('execute')->with(['+00:00'])->willReturn(true);
+            $pdo = $this->createMock(PDO::class);
+            $pdo->expects($this->once())->method('prepare')->with('SET time_zone = ?')->willReturn($statement);
+
+            $this->apply($pdo);
+        }
+    }
+
+    /**
+     * A refused SET fails loudly, naming MYSQL_TIME_ZONE and the tz-tables hint
+     *
+     * @return void
+     */
+    public function testRefusedTimeZoneFailsLoudly(): void
+    {
+        putenv('MYSQL_TIME_ZONE=America/New_York');
+        $pdo = $this->createMock(PDO::class);
+        $pdo->method('prepare')->willThrowException(new PDOException("Unknown or incorrect time zone: 'America/New_York'"));
+
+        try {
+            $this->apply($pdo);
+            $this->fail('Expected a DtoException');
+        } catch (DtoException $e) {
+            $this->assertStringContainsString('MYSQL_TIME_ZONE', $e->getMessage());
+            $this->assertStringContainsString('time-zone tables', $e->getMessage());
+        }
+    }
+
+    /**
+     * Through getPdo(): a MySQL connection is put on the zone, read and write each, once
+     *
+     * @return void
+     */
+    public function testGetPdoAppliesTheZoneToReadAndWriteConnections(): void
+    {
+        putenv('MYSQL_TIME_ZONE=+00:00');
+        $log     = new stdClass();
+        $service = $this->probe($log, 'mysql');
+
+        $service->getColumn('SELECT 1'); // Read
+        $service->query('UPDATE t SET a = 1'); // Write
+        $service->getColumn('SELECT 1'); // Cached connection: no second SET
+
+        $this->assertSame(['read:+00:00', 'write:+00:00'], $log->sets);
+    }
+
+    /**
+     * Through getPdo(): nothing is issued when unset, or on a non-MySQL driver
+     *
+     * @return void
+     */
+    public function testGetPdoIssuesNoSetWhenUnsetOrNotMysql(): void
+    {
+        putenv('MYSQL_TIME_ZONE');
+        $log = new stdClass();
+        $this->probe($log, 'mysql')->getColumn('SELECT 1');
+        $this->assertSame([], $log->sets);
+
+        putenv('MYSQL_TIME_ZONE=+00:00');
+        $log = new stdClass();
+        $this->probe($log, 'sqlite', 'sqlite:')->getColumn('SELECT 1');
+        $this->assertSame([], $log->sets);
+    }
+
+    /**
+     * Through getPdo(): a refused zone fails loudly and the connection is not cached
+     *
+     * @return void
+     */
+    public function testGetPdoDoesNotCacheAConnectionWhoseZoneWasRefused(): void
+    {
+        putenv('MYSQL_TIME_ZONE=America/New_York');
+        $log     = new stdClass();
+        $service = $this->probe($log, 'mysql', refuse: true);
+
+        for ($attempt = 1; $attempt <= 2; $attempt++) {
+            try {
+                $service->getColumn('SELECT 1');
+                $this->fail('Expected a DtoException');
+            } catch (DtoException $e) {
+                $this->assertStringContainsString('MYSQL_TIME_ZONE', $e->getMessage());
+            }
+        }
+
+        $this->assertSame(2, $log->opens, 'the second call must open a fresh connection, not reuse a cached one');
+    }
+
+    /**
+     * A malformed zone is refused when the service is initialized, before any query
+     *
+     * @return void
+     */
+    public function testMalformedZoneIsRefusedAtInitialization(): void
+    {
+        putenv('MYSQL_TIME_ZONE=abc def');
+        $this->expectException(InvalidArgumentException::class);
+        $this->expectExceptionMessageMatches('/MYSQL_TIME_ZONE/');
+        $this->probe(new stdClass(), 'mysql');
+    }
+
+    /**
+     * Through getPdo(): a changed MYSQL_TIME_ZONE is never served by a connection still on the old zone
+     *
+     * @return void
+     */
+    public function testGetPdoDoesNotReuseAConnectionOnAnotherZone(): void
+    {
+        $log     = new stdClass();
+        $service = $this->probe($log, 'mysql');
+
+        putenv('MYSQL_TIME_ZONE=+00:00');
+        $service->getColumn('SELECT 1');
+        putenv('MYSQL_TIME_ZONE=+01:00');
+        $service->getColumn('SELECT 1');
+        $service->getColumn('SELECT 1'); // Same zone again: cached
+
+        $this->assertSame(['read:+00:00', 'read:+01:00'], $log->sets);
+    }
+
+    /**
      * Test that the class is following uBix standards
      *
      * @return void
@@ -23,5 +222,178 @@ final class MysqlPdoSqlServiceTest extends UbixConcreteClassOrEnumTestCase imple
     public function testFollowingUbixStandards(): void
     {
         $this->testClassFollowingUbixStandards(MysqlPdoSqlService::class);
+    }
+
+    /**
+     * Build a mock for the probe service (createMock is protected)
+     *
+     * @param class-string $class Class to mock
+     *
+     * @return \PHPUnit\Framework\MockObject\Stub
+     */
+    public function mock(string $class): object
+    {
+        return $this->createStub($class);
+    }
+
+    /**
+     * @return array<string, array{string}>
+     */
+    public static function validTimeZones(): array
+    {
+        return [
+            'etc zone'        => ['Etc/GMT+5'],
+            'max east'        => ['+14:00'],
+            'max west'        => ['-13:59'],
+            'named'           => ['America/New_York'],
+            'negative offset' => ['-05:30'],
+            'short name'      => ['UTC'],
+            'system'          => ['SYSTEM'],
+            'utc offset'      => ['+00:00'],
+        ];
+    }
+
+    /**
+     * @return array<string, array{string}>
+     */
+    public static function invalidTimeZones(): array
+    {
+        return [
+            'bad minutes'   => ['+05:60'],
+            'injection'     => ["UTC'; DROP TABLE users; --"],
+            'leading digit' => ['1UTC'],
+            'negative zero' => ['-00:00'],
+            'no sign'       => ['05:00'],
+            'quote'         => ["+00:00'"],
+            'space'         => ['abc def'],
+            'too far east'  => ['+14:01'],
+            'too far west'  => ['-14:00'],
+            'too long'      => [str_repeat('a', 65)],
+        ];
+    }
+
+    /**
+     * Clear the time zone setting
+     *
+     * @return void
+     */
+    protected function tearDown(): void
+    {
+        putenv('MYSQL_TIME_ZONE');
+        parent::tearDown();
+    }
+
+    /**
+     * A service whose connections are mock PDOs that record what is done to them
+     *
+     * The log holds `opens` (int), and `sets` (a list of "<side>:<value>" for each SET time_zone run).
+     *
+     * @param stdClass $log    Where the probe records what happened
+     * @param string   $driver Driver name the mock PDOs report
+     * @param string   $dsn    DSN prefix (made unique so the static connection cache never carries over between tests)
+     * @param bool     $refuse Whether the mock server refuses SET time_zone
+     *
+     * @return PdoSqlService
+     */
+    private function probe(stdClass $log, string $driver, string $dsn = 'mysql:', bool $refuse = false): PdoSqlService
+    {
+        $log->opens = 0;
+        $log->sets  = [];
+
+        return new class ($this, $log, $driver, $dsn . uniqid('probe', true), $refuse) extends PdoSqlService {
+            /**
+             * @param MysqlPdoSqlServiceTest $testCase The test case, for building mocks
+             * @param stdClass               $log      Where to record what happened
+             * @param string                 $driver   Driver name the mock PDOs report
+             * @param string                 $dsn      Unique DSN prefix
+             * @param bool                   $refuse   Whether the mock server refuses SET time_zone
+             */
+            public function __construct(
+                private MysqlPdoSqlServiceTest $testCase,
+                private stdClass $log,
+                private string $driver,
+                string $dsn,
+                private bool $refuse,
+            ) {
+                parent::__construct(new NullLogger());
+                $this->initializePdoConstructorParameters(readDsn: $dsn . 'read', writeDsn: $dsn . 'write');
+            }
+
+            /**
+             * {@inheritDoc}
+             */
+            protected function openPdo(PdoConstructorParameters $parameters): PDO
+            {
+                $opens            = $this->log->opens;
+                $this->log->opens = (is_int($opens) ? $opens : 0) + 1;
+                $side             = str_ends_with($parameters->dsn, 'write') ? 'write' : 'read';
+
+                $statement = $this->testCase->mock(PDOStatement::class);
+                $statement->method('execute')->willReturn(true);
+                $statement->method('rowCount')->willReturn(1);
+                $statement->method('fetchColumn')->willReturn('1');
+
+                $pdo = $this->testCase->mock(PDO::class);
+                $pdo->method('getAttribute')->willReturn($this->driver);
+                $pdo->method('prepare')->willReturnCallback(function (string $sql) use ($side, $statement) {
+                    if (str_starts_with($sql, 'SET time_zone')) {
+                        $statement = $this->testCase->mock(PDOStatement::class);
+                        $statement->method('execute')->willReturnCallback(function (array $values) use ($side): bool {
+                            if ($this->refuse) {
+                                throw new PDOException("Unknown or incorrect time zone: 'America/New_York'");
+                            }
+                            $this->log->sets = [...(array) $this->log->sets, $side . ':' . (is_string($values[0]) ? $values[0] : '')];
+                            return true;
+                        });
+                    }
+                    return $statement;
+                });
+
+                assert($pdo instanceof PDO);
+
+                return $pdo;
+            }
+        };
+    }
+
+    /**
+     * Read MYSQL_TIME_ZONE through the protected connectionTimeZone() hook
+     *
+     * @return ?string
+     */
+    private function timeZone(): ?string
+    {
+        $result = $this->callProtected('connectionTimeZone');
+        $this->assertTrue($result === null || is_string($result));
+
+        return $result;
+    }
+
+    /**
+     * Apply MYSQL_TIME_ZONE to a connection through the protected applyConnectionTimeZone() hook
+     *
+     * @param PDO $pdo A connection
+     *
+     * @return void
+     */
+    private function apply(PDO $pdo): void
+    {
+        $this->callProtected('applyConnectionTimeZone', $pdo);
+    }
+
+    /**
+     * Call a protected method of the abstract service on a bare concrete subclass
+     *
+     * @param string $method  Method name
+     * @param mixed  ...$args Arguments
+     *
+     * @return mixed
+     */
+    private function callProtected(string $method, mixed ...$args): mixed
+    {
+        $service = new class (new NullLogger()) extends PdoSqlService {
+        };
+
+        return (new ReflectionMethod($service, $method))->invoke($service, ...$args);
     }
 }
