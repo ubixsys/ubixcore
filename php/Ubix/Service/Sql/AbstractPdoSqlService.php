@@ -370,10 +370,12 @@ abstract class AbstractPdoSqlService implements SqlService
         $this->ensureInitialized();
 
         try {
-            $singletonKey = md5(serialize($useWrite ? $this->writePdoConstructorParameters : $this->readPdoConstructorParameters));
+            $parameters   = $useWrite ? $this->writePdoConstructorParameters : $this->readPdoConstructorParameters;
+            $timeZone     = str_starts_with($parameters->dsn, 'mysql:') ? $this->connectionTimeZone() : null; // The zone is part of the key: a connection already on another zone is never reused
+            $singletonKey = md5(serialize($parameters) . '|time_zone=' . ($timeZone ?? ''));
 
             if (!isset(self::$singletons[$singletonKey])) {
-                $pdo = $this->openPdo($useWrite ? $this->writePdoConstructorParameters : $this->readPdoConstructorParameters);
+                $pdo = $this->openPdo($parameters);
 
                 $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
                 $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);

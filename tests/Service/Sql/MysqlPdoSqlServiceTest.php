@@ -196,6 +196,25 @@ final class MysqlPdoSqlServiceTest extends UbixConcreteClassOrEnumTestCase imple
     }
 
     /**
+     * Through getPdo(): a changed MYSQL_TIME_ZONE is never served by a connection still on the old zone
+     *
+     * @return void
+     */
+    public function testGetPdoDoesNotReuseAConnectionOnAnotherZone(): void
+    {
+        $log     = new stdClass();
+        $service = $this->probe($log, 'mysql');
+
+        putenv('MYSQL_TIME_ZONE=+00:00');
+        $service->getColumn('SELECT 1');
+        putenv('MYSQL_TIME_ZONE=+01:00');
+        $service->getColumn('SELECT 1');
+        $service->getColumn('SELECT 1'); // Same zone again: cached
+
+        $this->assertSame(['read:+00:00', 'read:+01:00'], $log->sets);
+    }
+
+    /**
      * Test that the class is following uBix standards
      *
      * @return void
