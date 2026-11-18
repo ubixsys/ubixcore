@@ -237,6 +237,10 @@ abstract class AbstractPdoSqlService implements SqlService
      * as `America/New_York`. A named zone only works where the server has its
      * time-zone tables loaded; `SYSTEM` and offsets always work.
      *
+     * It is validated when the service is initialized (the constructor, or the
+     * first use for the lazily initialized migration service), and again as each
+     * connection is opened.
+     *
      * @return ?string The zone to apply to each new connection, or null to leave the server default
      *
      * @throws InvalidArgumentException When `MYSQL_TIME_ZONE` is not a time zone name, `SYSTEM` or an offset
@@ -318,6 +322,11 @@ abstract class AbstractPdoSqlService implements SqlService
         ?string $writePassword = null,
         ?array $writeOptions = null,
     ): void {
+        // Fail at initialization, not on the first query, when MYSQL_TIME_ZONE is malformed and a MySQL connection is configured
+        if (str_starts_with($readDsn, 'mysql:') || str_starts_with((string) $writeDsn, 'mysql:')) {
+            $this->connectionTimeZone();
+        }
+
         $readPdoConstructorParameters = new PdoConstructorParameters(
             dsn:      $readDsn,
             username: $readUsername,
@@ -333,6 +342,18 @@ abstract class AbstractPdoSqlService implements SqlService
             password: $writePassword,
             options:  $writeOptions,
         );
+    }
+
+    /**
+     * Open a new PDO connection (a seam so tests can inject one)
+     *
+     * @param PdoConstructorParameters $parameters The connection parameters
+     *
+     * @return PDO A new, unconfigured connection
+     */
+    protected function openPdo(PdoConstructorParameters $parameters): PDO
+    {
+        return new PDO($parameters->dsn, $parameters->username, $parameters->password, $parameters->options);
     }
 
     /**
@@ -352,12 +373,7 @@ abstract class AbstractPdoSqlService implements SqlService
             $singletonKey = md5(serialize($useWrite ? $this->writePdoConstructorParameters : $this->readPdoConstructorParameters));
 
             if (!isset(self::$singletons[$singletonKey])) {
-                $pdo = new PDO(
-                    $useWrite ? $this->writePdoConstructorParameters->dsn : $this->readPdoConstructorParameters->dsn,
-                    $useWrite ? $this->writePdoConstructorParameters->username : $this->readPdoConstructorParameters->username,
-                    $useWrite ? $this->writePdoConstructorParameters->password : $this->readPdoConstructorParameters->password,
-                    $useWrite ? $this->writePdoConstructorParameters->options : $this->readPdoConstructorParameters->options,
-                );
+                $pdo = $this->openPdo($useWrite ? $this->writePdoConstructorParameters : $this->readPdoConstructorParameters);
 
                 $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
                 $pdo->setAttribute(PDO::ATTR_DEFAULT_FETCH_MODE, PDO::FETCH_ASSOC);
