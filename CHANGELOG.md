@@ -23,6 +23,12 @@
   before; any other value (`Dynamic`, `dynmic`, `kv2`) used to run the `kv` strategy
   silently and now fails at startup with an error naming it, before the cache or the
   vault is consulted.
+- Fix: a 2xx Vault response whose body is not a JSON object or array (an HTML page from
+  a proxy, a truncated body, a bare `"ok"`) now fails as a `RuntimeException` naming the
+  path and status, with the decode error as the previous exception. It escaped as
+  `DtoException` or `TypeError` before, past every `@throws RuntimeException` on
+  `VaultService` and the resolver's fail-closed contract. An empty body is still an
+  empty response.
 
 ### Docs
 

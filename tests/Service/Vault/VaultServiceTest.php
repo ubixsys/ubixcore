@@ -275,6 +275,44 @@ final class VaultServiceTest extends UbixConcreteClassOrEnumTestCase implements 
     }
 
     /**
+     * A 2xx whose body is not a JSON object or array fails as a RuntimeException, keeping the cause
+     *
+     * @param string $body The undecodable response body
+     *
+     * @return void
+     */
+    #[DataProvider('undecodableBodies')]
+    public function testUndecodable2xxBodyThrowsRuntimeException(string $body): void
+    {
+        $logger = $this->createMock(Logger::class);
+        $logger->expects($this->once())
+            ->method('error')
+            ->with('uBix Vault response was not decodable JSON', ['method' => 'GET', 'path' => '/v1/secret/data/app/db', 'status' => 200]);
+
+        try {
+            $this->service([new Response(200, ['Content-Type' => 'text/html'], $body)], $logger)
+                ->readKvV2Secret(self::VAULT_ADDRESS, self::TOKEN, 'app/db');
+            $this->fail('Expected a RuntimeException for an undecodable body');
+        } catch (RuntimeException $exception) {
+            $this->assertSame('uBix Vault request to `/v1/secret/data/app/db` returned a 200 whose body is not a JSON object or array', $exception->getMessage());
+            $this->assertNotNull($exception->getPrevious(), 'The decode error is kept as the previous exception');
+        }
+    }
+
+    /**
+     * An empty 2xx body (e.g. revoke-self's 204) is still an empty response, not a decode failure
+     *
+     * @return void
+     */
+    public function testEmpty2xxBodyIsAnEmptyResponse(): void
+    {
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('KV read for `app/db` returned no data map');
+
+        $this->service([new Response(200, [], " \n")])->readKvV2Secret(self::VAULT_ADDRESS, self::TOKEN, 'app/db');
+    }
+
+    /**
      * A transport failure is logged without the token and surfaced as a RuntimeException
      *
      * @return void
@@ -351,6 +389,21 @@ final class VaultServiceTest extends UbixConcreteClassOrEnumTestCase implements 
             'space'            => ['my jwt'],
             'trailing newline' => ["jwt\n"],
             'traversal'        => ['../../sys'],
+        ];
+    }
+
+    /**
+     * 2xx bodies that do not decode to a JSON object or array
+     *
+     * @return array<string, array{0: string}>
+     */
+    public static function undecodableBodies(): array
+    {
+        return [
+            'html error page' => ['<html><body>502 Bad Gateway</body></html>'],
+            'json number'     => ['1'],
+            'json string'     => ['"ok"'],
+            'truncated json'  => ['{"data":{"data":'],
         ];
     }
 

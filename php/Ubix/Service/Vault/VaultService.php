@@ -8,6 +8,8 @@ use GuzzleHttp\ClientInterface as Client;
 use GuzzleHttp\Exception\GuzzleException;
 use Psr\Log\LoggerInterface as Logger;
 use RuntimeException;
+use TypeError;
+use Ubix\Exception\DtoException;
 use Ubix\Service\JsonService;
 
 /**
@@ -204,7 +206,7 @@ final class VaultService
      * @param ?string                    $token        Vault token to send, or null for unauthenticated calls (login)
      * @param array<string, string>|null $jsonBody     Optional JSON request body
      *
-     * @throws RuntimeException If the request fails at the transport level
+     * @throws RuntimeException If the request fails at the transport level, or a 2xx body is not a JSON object or array
      *
      * @return array<mixed> The decoded JSON response body
      */
@@ -236,6 +238,22 @@ final class VaultService
         $body = (string) $response->getBody();
 
         // Some endpoints (e.g. revoke-self) answer 204 with no body.
-        return trim($body) === '' ? [] : $this->jsonService->decode($body);
+        if (trim($body) === '') {
+            return [];
+        }
+
+        //
+        //  The decode is guarded the same way the transport call is. JsonService::decode()
+        //  throws DtoException (an Exception, not a RuntimeException) for a body that is
+        //  not JSON, and its array return type turns a scalar JSON body (`"ok"`, `1`) into
+        //  a TypeError. Either would escape the RuntimeException contract every caller of
+        //  this class relies on, e.g. an HTML error page served with a 200 by a proxy.
+        //
+        try {
+            return $this->jsonService->decode($body);
+        } catch (DtoException | TypeError $exception) { // @phpstan-ignore catch.neverThrown (JsonService::decode() raises TypeError from its array return type for a scalar JSON body; PHPStan reads only its @throws)
+            $this->logger->error('uBix Vault response was not decodable JSON', ['method' => $method, 'path' => $path, 'status' => $response->getStatusCode()]);
+            throw new RuntimeException('uBix Vault request to `' . $path . '` returned a ' . $response->getStatusCode() . ' whose body is not a JSON object or array', 0, $exception);
+        }
     }
 }
