@@ -27,8 +27,9 @@ use Throwable;
  * (`VAULT_APP_KV_PATH(S)`) are hydrated. It is never optional by default.
  *
  * Auth: prefers a static `VAULT_TOKEN` (dev/CI); otherwise, in-cluster, logs in
- * with the Kubernetes auth method using the pod's mounted service-account JWT
- * and `VAULT_K8S_ROLE`. A token obtained by logging in is revoked as soon as the
+ * with the pod's mounted service-account JWT and `VAULT_K8S_ROLE` on the auth mount
+ * named by `VAULT_AUTH_PATH` (default `kubernetes`; e.g. `jwt` for a vault that
+ * validates several clusters' tokens by public key). A token obtained by logging in is revoked as soon as the
  * reads are done — it is not needed afterwards, and a token left to expire is a
  * live credential (and a stored record in the vault) until it does. A static
  * `VAULT_TOKEN` is never revoked: it is not this process's to end.
@@ -319,8 +320,9 @@ final class VaultCredentialResolverService
 
     /**
      * Run $use with a Vault client token: a static VAULT_TOKEN when present,
-     * otherwise a Kubernetes-auth login with the pod's service-account JWT — which
-     * is revoked afterwards, whether $use succeeded or not.
+     * otherwise a login with the pod's service-account JWT on the `VAULT_AUTH_PATH`
+     * mount (default `kubernetes`) — which is revoked afterwards, whether $use
+     * succeeded or not.
      *
      * A failed revocation is logged and otherwise ignored: the token still expires
      * on its own, and failing the request over it would trade a stray token for an
@@ -329,7 +331,7 @@ final class VaultCredentialResolverService
      * @param string              $vaultAddress Base address of the Vault server
      * @param callable(string): T $use          What to do with the token
      *
-     * @throws RuntimeException If no usable auth method is configured
+     * @throws RuntimeException If no usable auth method is configured, or VAULT_AUTH_PATH is not one path segment
      *
      * @return T What $use returned
      *
@@ -349,8 +351,14 @@ final class VaultCredentialResolverService
             );
         }
 
-        $jwt   = (string) file_get_contents($this->serviceAccountTokenPath);
-        $token = $this->vaultService->loginKubernetes($vaultAddress, $role, trim($jwt));
+        $authPath = $this->readEnv('VAULT_AUTH_PATH');
+        $jwt      = (string) file_get_contents($this->serviceAccountTokenPath);
+        $token    = $this->vaultService->loginWithServiceAccountJwt(
+            $vaultAddress,
+            $authPath !== '' ? $authPath : VaultService::DEFAULT_AUTH_PATH,
+            $role,
+            trim($jwt),
+        );
 
         try {
             return $use($token);
@@ -394,7 +402,7 @@ final class VaultCredentialResolverService
     {
         $settings = [$vaultAddress];
 
-        foreach (['VAULT_K8S_ROLE', 'VAULT_DB_STRATEGY', 'VAULT_DB_KV_PATH', 'VAULT_DB_ROLE', 'VAULT_APP_KV_PATH', 'VAULT_APP_KV_PATHS'] as $name) {
+        foreach (['VAULT_AUTH_PATH', 'VAULT_K8S_ROLE', 'VAULT_DB_STRATEGY', 'VAULT_DB_KV_PATH', 'VAULT_DB_ROLE', 'VAULT_APP_KV_PATH', 'VAULT_APP_KV_PATHS'] as $name) {
             $settings[] = $name . '=' . $this->readEnv($name);
         }
 

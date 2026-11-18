@@ -121,6 +121,47 @@ final class VaultServiceTest extends UbixConcreteClassOrEnumTestCase implements 
     }
 
     /**
+     * A service-account login on another mount POSTs the same body to /v1/auth/<mount>/login
+     *
+     * @return void
+     */
+    public function testLoginWithServiceAccountJwtUsesTheGivenMount(): void
+    {
+        $token = $this->service([$this->json(['auth' => ['client_token' => 'hvs.issued']])])
+            ->loginWithServiceAccountJwt(self::VAULT_ADDRESS, 'jwt', 'kitg-api', 'the.jwt.value');
+
+        $this->assertSame('hvs.issued', $token);
+
+        $request = $this->onlyRequest();
+        $this->assertSame('POST', $request->getMethod());
+        $this->assertSame(self::VAULT_ADDRESS . '/v1/auth/jwt/login', (string) $request->getUri());
+        $this->assertFalse($request->hasHeader('X-Vault-Token'), 'Login is unauthenticated; no token header is sent');
+        $this->assertSame(['jwt' => 'the.jwt.value', 'role' => 'kitg-api'], $this->decodeBody($request));
+    }
+
+    /**
+     * A mount that is not one safe path segment is refused before any request is sent
+     *
+     * @param string $authPath The rejected mount
+     *
+     * @return void
+     */
+    #[DataProvider('unsafeAuthPaths')]
+    public function testLoginWithServiceAccountJwtRefusesAnUnsafeMount(string $authPath): void
+    {
+        try {
+            $this->service([$this->json(['auth' => ['client_token' => 'hvs.issued']])])
+                ->loginWithServiceAccountJwt(self::VAULT_ADDRESS, $authPath, 'kitg-api', 'jwt');
+            $this->fail('Expected an unsafe mount to be refused');
+        } catch (RuntimeException $exception) {
+            $this->assertStringContainsString('VAULT_AUTH_PATH must be a single path segment', $exception->getMessage());
+            $this->assertStringContainsString('`' . $authPath . '`', $exception->getMessage(), 'The bad value is named');
+        }
+
+        $this->assertSame([], $this->requests, 'Nothing is sent to the vault');
+    }
+
+    /**
      * A KV v2 read GETs /v1/secret/data/<path> with the token and returns the inner data map
      *
      * @return void
@@ -288,6 +329,28 @@ final class VaultServiceTest extends UbixConcreteClassOrEnumTestCase implements 
             'no auth block'      => [['errors' => ['permission denied']]],
             'no client_token'    => [['auth' => ['policies' => ['default']]]],
             'non-string token'   => [['auth' => ['client_token' => 12345]]],
+        ];
+    }
+
+    /**
+     * Auth mounts that are not one safe path segment
+     *
+     * @return array<string, array{0: string}>
+     */
+    public static function unsafeAuthPaths(): array
+    {
+        return [
+            'dot'              => ['.'],
+            'dot dot'          => ['..'],
+            'dotted name'      => ['jwt.prod'],
+            'empty'            => [''],
+            'encoded slash'    => ['jwt%2Fx'],
+            'leading slash'    => ['/jwt'],
+            'nested'           => ['jwt/x'],
+            'query'            => ['jwt?x=1'],
+            'space'            => ['my jwt'],
+            'trailing newline' => ["jwt\n"],
+            'traversal'        => ['../../sys'],
         ];
     }
 

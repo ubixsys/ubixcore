@@ -49,6 +49,7 @@ committed.
 VAULT_ADDR=https://vault.example.com     # turns the hook on
 VAULT_TOKEN=...                          # local dev / CI - or, in Kubernetes:
 VAULT_K8S_ROLE=acme-api                  # service-account auth, no token on disk
+VAULT_AUTH_PATH=kubernetes               # auth mount for that login (default); e.g. jwt
 VAULT_DB_KV_PATH=app/db                  # KV v2 secret holding read_/write_username + _password
 VAULT_TEST_DB_KV_PATH=app/test-db        # KV v2 secret holding the unit-test connection
 VAULT_CACHE_TTL=300                      # seconds to reuse resolved values (APCu); 0 = off
@@ -64,8 +65,13 @@ Under PHP-FPM the bootstrap runs on every request, so the resolved values are
 cached in APCu (built into the uBixCore runtime image) for `VAULT_CACHE_TTL`
 seconds, default 300: a pool logs in to Vault a few times an hour, not per
 request, and a brief Vault outage does not fail requests. A rotated secret
-reaches the app within one TTL. A token obtained by Kubernetes login is revoked
-as soon as the reads are done; a static `VAULT_TOKEN` is never revoked.
+reaches the app within one TTL. A token obtained by service-account login is
+revoked as soon as the reads are done; a static `VAULT_TOKEN` is never revoked.
+
+`VAULT_AUTH_PATH` names the auth mount the service-account login uses. It
+defaults to `kubernetes`; set it when the role lives elsewhere, such as a `jwt`
+mount that validates several clusters' tokens by public key. It must be a single
+path segment (letters, digits, `-`, `_`), and anything else fails at startup.
 
 `VAULT_TEST_DB_KV_PATH` does the same for the PHPUnit connection, and its secret
 carries the **whole** connection — `host`, `port`, `database`, `username`,

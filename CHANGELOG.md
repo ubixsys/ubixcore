@@ -11,6 +11,15 @@
   server's time-zone tables loaded, so use `SYSTEM` or an offset where they are not. See
   `docs/standards/database.md` and `.env.example`.
 
+### uBixVault
+
+- `VAULT_AUTH_PATH` names the auth mount the service-account login uses (default
+  `kubernetes`, so nothing changes when it is unset). A role on a `jwt` mount, or on a
+  mount enabled under another name, could not log in before: the path was hard-coded.
+  The value must be one path segment (letters, digits, `-`, `_`); anything else, such
+  as `jwt/x` or `../sys`, fails before the vault is contacted. New
+  `VaultService::loginWithServiceAccountJwt()`; `loginKubernetes()` is unchanged.
+
 ### Docs
 
 - New: `docs/ci.md` — the CI pipeline doc (stages, jobs, the Kelpie include, and how

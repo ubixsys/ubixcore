@@ -13,7 +13,7 @@ use Ubix\Service\JsonService;
 /**
  * Minimal client for uBix Vault — the uBix family's HashiCorp-Vault-compatible
  * secrets manager (see ~/git/ubixvault). Speaks the standard Vault HTTP API:
- * token/Kubernetes auth, KV v2 secret reads, and dynamic database credentials.
+ * token and service-account JWT auth (`kubernetes` or `jwt` mount), KV v2 secret reads, and dynamic database credentials.
  *
  * This is deliberately read-only and stateless: callers pass the Vault address
  * and (post-auth) token into each method, so a single instance can serve both
@@ -24,7 +24,19 @@ use Ubix\Service\JsonService;
  */
 final class VaultService
 {
-    private const AUTH_KUBERNETES_LOGIN = '/v1/auth/kubernetes/login';
+    /**
+     * Auth mount used by {@see loginKubernetes()} and when `VAULT_AUTH_PATH` is unset
+     */
+    public const DEFAULT_AUTH_PATH = 'kubernetes';
+
+    private const AUTH_LOGIN_TEMPLATE = '/v1/auth/%s/login';
+
+    /**
+     * One path segment: letters, digits, `-` and `_`. The mount arrives from an
+     * environment variable, so without this a value like `../../sys` or `jwt/x` would
+     * be interpolated straight into the request path.
+     */
+    private const AUTH_PATH_PATTERN = '/^[A-Za-z0-9_-]+\z/';
 
     private const AUTH_TOKEN_REVOKE_SELF = '/v1/auth/token/revoke-self';
 
@@ -49,22 +61,51 @@ final class VaultService
     }
 
     /**
-     * Authenticate via the Kubernetes auth method and return a client token.
+     * Authenticate via the Kubernetes auth method (the `kubernetes` mount) and return a client token.
      *
-     * The pod presents its service-account JWT; Vault validates it against the
-     * bound role and issues a short-lived client token.
+     * Shorthand for {@see loginWithServiceAccountJwt()} on the default mount; a failed
+     * login, or one that returns no client token, surfaces from it as a RuntimeException.
      *
      * @param string $vaultAddress      Base address of the Vault server (e.g. https://vault.internal:8200)
      * @param string $role              The Kubernetes auth role to log in as
      * @param string $serviceAccountJwt The pod's service-account JWT
      *
-     * @throws RuntimeException If the login fails or returns no client token
-     *
      * @return string The issued Vault client token
      */
     public function loginKubernetes(string $vaultAddress, string $role, string $serviceAccountJwt): string
     {
-        $response = $this->send($vaultAddress, 'POST', self::AUTH_KUBERNETES_LOGIN, null, [
+        return $this->loginWithServiceAccountJwt($vaultAddress, self::DEFAULT_AUTH_PATH, $role, $serviceAccountJwt);
+    }
+
+    /**
+     * Authenticate with the pod's service-account JWT on the given auth mount and return a client token.
+     *
+     * The pod presents its service-account JWT; Vault validates it against the bound
+     * role and issues a short-lived client token. The mount selects the engine: the
+     * `kubernetes` method (TokenReview against one API server) and the `jwt` method
+     * (signature check against configured public keys, e.g. several clusters behind one
+     * vault) take the same `{"role": ..., "jwt": ...}` body and differ only in the mount,
+     * which may also have been enabled under another name.
+     *
+     * @param string $vaultAddress      Base address of the Vault server (e.g. https://vault.internal:8200)
+     * @param string $authPath          Auth mount, one path segment (e.g. `kubernetes` or `jwt`)
+     * @param string $role              The auth role to log in as
+     * @param string $serviceAccountJwt The pod's service-account JWT
+     *
+     * @throws RuntimeException If the mount is not a single safe path segment, the login fails,
+     *                          or the response carries no client token
+     *
+     * @return string The issued Vault client token
+     */
+    public function loginWithServiceAccountJwt(string $vaultAddress, string $authPath, string $role, string $serviceAccountJwt): string
+    {
+        if (preg_match(self::AUTH_PATH_PATTERN, $authPath) !== 1) {
+            throw new RuntimeException(
+                'VAULT_AUTH_PATH must be a single path segment of letters, digits, `-` or `_`; got `' . $authPath . '`',
+            );
+        }
+
+        $response = $this->send($vaultAddress, 'POST', sprintf(self::AUTH_LOGIN_TEMPLATE, $authPath), null, [
             'jwt'  => $serviceAccountJwt,
             'role' => $role,
         ]);
@@ -73,7 +114,7 @@ final class VaultService
         $token = is_array($auth) ? ($auth['client_token'] ?? null) : null;
 
         if (! is_string($token) || $token === '') {
-            throw new RuntimeException('uBix Vault Kubernetes login did not return a client_token');
+            throw new RuntimeException('uBix Vault login at auth/' . $authPath . ' did not return a client_token');
         }
 
         return $token;

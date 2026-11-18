@@ -34,7 +34,7 @@ final class VaultCredentialResolverServiceTest extends UbixConcreteClassOrEnumTe
         'TEST_MYSQL_WRITE_HOST', 'TEST_MYSQL_WRITE_PORT', 'TEST_MYSQL_WRITE_DATABASE',
         'TEST_MYSQL_WRITE_USERNAME', 'TEST_MYSQL_WRITE_PASSWORD',
         'API_BEARER_TOKENS', 'lower_case_key', 'VAULT_ADDR_OVERRIDE', 'OWN_KEY', 'SHARED_KEY', 'OTHER_KEY',
-        'VAULT_CACHE_TTL',
+        'VAULT_CACHE_TTL', 'VAULT_AUTH_PATH',
     ];
 
     private const VAULT_ADDRESS = 'https://vault.test';
@@ -610,6 +610,59 @@ final class VaultCredentialResolverServiceTest extends UbixConcreteClassOrEnumTe
 
         $this->assertCount(3, $this->requests);
         $this->assertSame(self::VAULT_ADDRESS . '/v1/auth/token/revoke-self', (string) $this->requests[2]->getUri());
+    }
+
+    /**
+     * Without VAULT_AUTH_PATH the service-account login goes to the `kubernetes` mount
+     *
+     * @return void
+     */
+    public function testServiceAccountLoginDefaultsToTheKubernetesMount(): void
+    {
+        putenv('VAULT_K8S_ROLE=app');
+
+        $this->resolver([$this->json(['auth' => ['client_token' => 'hvs.minted']]), $this->kv(self::FULL_DB_SECRET), new Response(204)])
+            ->hydrateEnvironment(self::VAULT_ADDRESS);
+
+        $this->assertSame(self::VAULT_ADDRESS . '/v1/auth/kubernetes/login', (string) $this->requests[0]->getUri());
+    }
+
+    /**
+     * VAULT_AUTH_PATH selects the mount, e.g. a `jwt` mount, with the same role and JWT
+     *
+     * @return void
+     */
+    public function testAuthPathSelectsTheLoginMount(): void
+    {
+        putenv('VAULT_K8S_ROLE=app');
+        putenv('VAULT_AUTH_PATH=jwt');
+
+        $this->resolver([$this->json(['auth' => ['client_token' => 'hvs.minted']]), $this->kv(self::FULL_DB_SECRET), new Response(204)])
+            ->hydrateEnvironment(self::VAULT_ADDRESS);
+
+        $this->assertSame(self::VAULT_ADDRESS . '/v1/auth/jwt/login', (string) $this->requests[0]->getUri());
+        $this->assertSame('{"jwt":"the.pod.jwt","role":"app"}', (string) $this->requests[0]->getBody());
+        $this->assertSame('writer', getenv('MYSQL_WRITE_USERNAME'));
+    }
+
+    /**
+     * A VAULT_AUTH_PATH that is not one path segment fails before the vault is contacted
+     *
+     * @return void
+     */
+    public function testUnsafeAuthPathFailsBeforeContactingVault(): void
+    {
+        putenv('VAULT_K8S_ROLE=app');
+        putenv('VAULT_AUTH_PATH=../../sys');
+
+        try {
+            $this->resolver([$this->json(['auth' => ['client_token' => 'hvs.minted']])])->hydrateEnvironment(self::VAULT_ADDRESS);
+            $this->fail('Expected an unsafe VAULT_AUTH_PATH to be refused');
+        } catch (RuntimeException $exception) {
+            $this->assertStringContainsString('`../../sys`', $exception->getMessage());
+        }
+
+        $this->assertSame([], $this->requests);
     }
 
     /**
