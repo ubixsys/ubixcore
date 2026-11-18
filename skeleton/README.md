@@ -51,6 +51,7 @@ VAULT_TOKEN=...                          # local dev / CI - or, in Kubernetes:
 VAULT_K8S_ROLE=acme-api                  # service-account auth, no token on disk
 VAULT_AUTH_PATH=kubernetes               # auth mount for that login (default); e.g. jwt
 VAULT_DB_KV_PATH=app/db                  # KV v2 secret holding read_/write_username + _password
+VAULT_DB_STRATEGY=kv                     # kv (default), dynamic, or none for an app with no database
 VAULT_TEST_DB_KV_PATH=app/test-db        # KV v2 secret holding the unit-test connection
 VAULT_CACHE_TTL=300                      # seconds to reuse resolved values (APCu); 0 = off
 ```
@@ -60,6 +61,12 @@ The secret's keys `read_username`, `read_password`, `write_username`,
 and API keys follow the same pattern: store them in Vault, read them in the
 pipeline with a read-only token, and keep `.env` empty of anything you would
 not paste into a chat.
+
+`VAULT_DB_STRATEGY` picks how those credentials are read: `kv` (the default) reads
+the KV secret above, `dynamic` asks Vault to generate a pair for `VAULT_DB_ROLE`,
+and `none` skips the database read for an app that has no database (its app
+secrets at `VAULT_APP_KV_PATH(S)` still load). Any other value, including a typo
+or a different case, stops startup with an error naming it.
 
 Under PHP-FPM the bootstrap runs on every request, so the resolved values are
 cached in APCu (built into the uBixCore runtime image) for `VAULT_CACHE_TTL`

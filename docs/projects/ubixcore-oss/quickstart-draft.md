@@ -127,7 +127,7 @@ An app with no database sets `VAULT_DB_STRATEGY=none`: the `MYSQL_*` read is
 skipped and only the app secrets at `VAULT_APP_KV_PATH` / `VAULT_APP_KV_PATHS`
 are hydrated. Leave it unset for an app that has a database, so a missing
 database secret still fails loudly. (`kv`, the default, and `dynamic` are the
-other values.) Do the same for CI tokens
+other values; anything else stops startup with an error naming it.) Do the same for CI tokens
 and webhooks: Vault + a read-only token in the pipeline.
 
 ## 8. Database + migrations

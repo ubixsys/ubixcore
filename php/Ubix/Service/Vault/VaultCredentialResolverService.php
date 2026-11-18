@@ -24,7 +24,9 @@ use Throwable;
  * secret at `VAULT_DB_KV_PATH`; `dynamic`: generated credentials), and a missing or empty
  * secret fails loudly. An app with no database at all opts out explicitly with
  * `VAULT_DB_STRATEGY=none`: the database read is skipped and only the app secrets
- * (`VAULT_APP_KV_PATH(S)`) are hydrated. It is never optional by default.
+ * (`VAULT_APP_KV_PATH(S)`) are hydrated. It is never optional by default. Any other
+ * `VAULT_DB_STRATEGY` value (a typo, a different case) is refused by name before the
+ * vault or the cache is consulted, rather than quietly running the `kv` strategy.
  *
  * Auth: prefers a static `VAULT_TOKEN` (dev/CI); otherwise, in-cluster, logs in
  * with the pod's mounted service-account JWT and `VAULT_K8S_ROLE` on the auth mount
@@ -53,6 +55,16 @@ final class VaultCredentialResolverService
      * `VAULT_DB_STRATEGY` value for an app with no database: skip the credential read
      */
     private const STRATEGY_NONE = 'none';
+
+    /**
+     * `VAULT_DB_STRATEGY` value for a KV v2 secret at `VAULT_DB_KV_PATH` (also the default when unset)
+     */
+    private const STRATEGY_KV = 'kv';
+
+    /**
+     * `VAULT_DB_STRATEGY` value for generated database credentials for `VAULT_DB_ROLE`
+     */
+    private const STRATEGY_DYNAMIC = 'dynamic';
 
     private const CACHE_KEY_PREFIX = 'vault.environment.';
 
@@ -111,7 +123,8 @@ final class VaultCredentialResolverService
      *
      * Authentication or read failure propagates as a RuntimeException from the
      * callees (fail-closed — when Vault is configured we never silently fall
-     * back to potentially-stale environment values).
+     * back to potentially-stale environment values). So does a `VAULT_DB_STRATEGY`
+     * other than `kv`, `dynamic` or `none`, before the cache or the vault is consulted.
      *
      * @param string $vaultAddress Base address of the Vault server
      *
@@ -119,6 +132,7 @@ final class VaultCredentialResolverService
      */
     public function hydrateEnvironment(string $vaultAddress): void
     {
+        $strategy = $this->databaseStrategy();
         $cacheKey = $this->cacheKey($vaultAddress);
         $cached   = $this->cachedEnvironment($cacheKey);
 
@@ -129,7 +143,7 @@ final class VaultCredentialResolverService
             return;
         }
 
-        $skipDatabase = $this->readEnv('VAULT_DB_STRATEGY') === self::STRATEGY_NONE;
+        $skipDatabase = $strategy === self::STRATEGY_NONE;
 
         if ($skipDatabase) {
             $this->logger->info('Skipping database credentials (VAULT_DB_STRATEGY=none)');
@@ -144,9 +158,9 @@ final class VaultCredentialResolverService
 
         // Resolve everything before touching the environment, so a failure part-way
         // (an app secret, after the database credentials) leaves it as it was.
-        [$credentials, $appSecrets] = $this->withToken($vaultAddress, function (string $token) use ($vaultAddress, $skipDatabase): array {
+        [$credentials, $appSecrets] = $this->withToken($vaultAddress, function (string $token) use ($vaultAddress, $skipDatabase, $strategy): array {
             return [
-                $skipDatabase ? [] : $this->resolveCredentials($vaultAddress, $token),
+                $skipDatabase ? [] : $this->resolveCredentials($vaultAddress, $token, $strategy),
                 $this->resolveAppSecrets($vaultAddress, $token),
             ];
         });
@@ -166,7 +180,7 @@ final class VaultCredentialResolverService
             ]);
         }
 
-        if ($this->readEnv('VAULT_DB_STRATEGY') !== 'dynamic') {
+        if ($strategy !== self::STRATEGY_DYNAMIC) {
             $this->storeEnvironment($cacheKey, $credentials + $appSecrets);
         }
     }
@@ -493,16 +507,15 @@ final class VaultCredentialResolverService
      *
      * @param string $vaultAddress Base address of the Vault server
      * @param string $token        A valid Vault client token
+     * @param string $strategy     The validated strategy, `kv` or `dynamic`
      *
      * @throws RuntimeException If the configured KV secret is missing the expected keys
      *
      * @return array<string, string> Map of MYSQL_* env var name => value
      */
-    private function resolveCredentials(string $vaultAddress, string $token): array
+    private function resolveCredentials(string $vaultAddress, string $token, string $strategy): array
     {
-        $strategy = $this->readEnv('VAULT_DB_STRATEGY');
-
-        if ($strategy === 'dynamic') {
+        if ($strategy === self::STRATEGY_DYNAMIC) {
             $role  = $this->readEnv('VAULT_DB_ROLE') !== '' ? $this->readEnv('VAULT_DB_ROLE') : 'app';
             $creds = $this->vaultService->readDatabaseCredentials($vaultAddress, $token, $role);
 
@@ -532,6 +545,36 @@ final class VaultCredentialResolverService
         }
 
         return $resolved;
+    }
+
+    /**
+     * The database strategy from `VAULT_DB_STRATEGY`: `kv` when unset, otherwise one of
+     * `kv`, `dynamic` or `none`
+     *
+     * An allowlist, so that a typo or a different case (`Dynamic`, `dynmic`, `kv2`,
+     * `None`) fails closed instead of running the `kv` strategy the operator did not ask
+     * for: the read would succeed against the wrong secret, or an app meant to skip its
+     * database read would fail on it, with nothing pointing at the typo.
+     *
+     * @throws RuntimeException If the value is set and is not a known strategy
+     *
+     * @return string `kv`, `dynamic` or `none`
+     */
+    private function databaseStrategy(): string
+    {
+        $strategy = $this->readEnv('VAULT_DB_STRATEGY');
+
+        if ($strategy === '') {
+            return self::STRATEGY_KV;
+        }
+
+        if (!in_array($strategy, [self::STRATEGY_KV, self::STRATEGY_DYNAMIC, self::STRATEGY_NONE], true)) {
+            throw new RuntimeException(
+                'VAULT_DB_STRATEGY=`' . $strategy . '` is not a known strategy. Use `kv` (or leave it unset) for a KV v2 secret, `dynamic` for generated credentials, or `none` for an app with no database.',
+            );
+        }
+
+        return $strategy;
     }
 
     /**

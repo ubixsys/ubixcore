@@ -19,6 +19,10 @@
   The value must be one path segment (letters, digits, `-`, `_`); anything else, such
   as `jwt/x` or `../sys`, fails before the vault is contacted. New
   `VaultService::loginWithServiceAccountJwt()`; `loginKubernetes()` is unchanged.
+- Fix: `VAULT_DB_STRATEGY` is an allowlist. Unset, `kv`, `dynamic` and `none` work as
+  before; any other value (`Dynamic`, `dynmic`, `kv2`) used to run the `kv` strategy
+  silently and now fails at startup with an error naming it, before the cache or the
+  vault is consulted.
 
 ### Docs
 
