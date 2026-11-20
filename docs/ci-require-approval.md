@@ -32,7 +32,7 @@ repo with *no* jobs that run on such pipelines needs a `workflow:rules` that let
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `UBIX_APPROVAL_OWNERS` | none, **required** | Usernames (comma-separated) whose own Approve/👍 counts on their own MR. Empty fails the job with a message. `MERGE_APPROVAL_OWNERS` is accepted too. |
+| `UBIX_APPROVAL_OWNERS` | none, **required** | Usernames (comma-separated) whose Approve/👍 counts, on anyone's MR including their own. Nobody else's counts. Empty fails the job with a message. `MERGE_APPROVAL_OWNERS` is accepted too. |
 | `UBIX_APPROVAL_BRANCH` | the default branch | The branch whose MRs are guarded. An MR into any other branch passes with a note. |
 | `UBIX_APPROVAL_ARMS_MERGE` | `false` | `true`: a verified sign-off arms merge-when-pipeline-succeeds, pinned to the signed-off commit. Needs `APPROVAL_MERGE_TOKEN`. |
 | `UBIX_APPROVAL_IMAGE` | `alpine:3` | Job image. Shell runners ignore it. |
@@ -63,9 +63,10 @@ Overriding a key in the repo's own job merges with the included one; everything 
 
 ## What it checks
 
-Port of `bin/ubix ci:requireApproval`. Passes when the MR has an Approve or a 👍 from someone
-other than its author, or from its author when listed in the owners (the log says
-**SELF SIGN-OFF**). On a branch pipeline it finds the MR by source branch; no open MR fails.
+Port of `bin/ubix ci:requireApproval`. Passes when the MR has an Approve or a 👍 from a user
+listed in the owners, the author included (the log says **SELF SIGN-OFF** when the author is
+the only one). A sign-off from anyone else (another user, a bot, an agent token) is logged as
+not counted. On a branch pipeline it finds the MR by source branch; no open MR fails.
 Fails open (`UNVERIFIED`, passes) with no token or when GitLab is unreachable. GitLab does not
 re-run a pipeline when someone approves: approve, then retry the job (or let the uBixOps
 webhook do it). Agents never approve or 👍.

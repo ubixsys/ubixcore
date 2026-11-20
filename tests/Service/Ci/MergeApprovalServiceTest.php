@@ -58,19 +58,39 @@ final class MergeApprovalServiceTest extends UbixConcreteClassOrEnumTestCase imp
     }
 
     /**
-     * Someone other than the author pressing Approve is enough
+     * Only a listed owner's Approve counts; anyone else's is reported as ignored
      *
      * @return void
      */
-    public function testAnotherPersonsApprovalCounts(): void
+    public function testOnlyAnOwnersApprovalCounts(): void
     {
         $this->givenMergeRequest('dev', ['olga'], []);
 
-        $verdict = $this->buildService()->getVerdict(self::API, '7', 't', 3, []);
+        $verdict = $this->buildService()->getVerdict(self::API, '7', 't', 3, ['cwolsen']);
+        $this->assertFalse($verdict['approved']);
+        $this->assertSame([], $verdict['signedOffBy']);
+        $this->assertSame(['olga'], $verdict['ignored']);
 
+        $this->givenMergeRequest('dev', ['olga', 'cwolsen'], []);
+
+        $verdict = $this->buildService()->getVerdict(self::API, '7', 't', 3, ['cwolsen']);
         $this->assertTrue($verdict['approved']);
-        $this->assertSame(['olga'], $verdict['signedOffBy']);
+        $this->assertSame(['cwolsen'], $verdict['signedOffBy']);
         $this->assertFalse($verdict['selfSignOff']);
+    }
+
+    /**
+     * A bot or agent token's Approve or thumbs-up never satisfies the gate
+     *
+     * @return void
+     */
+    public function testBotsAndAgentsCannotSignOff(): void
+    {
+        $this->givenMergeRequest('cwolsen', ['group_223_bot_x'], [['agent-bot', 'thumbsup']]);
+
+        $verdict = $this->buildService()->getVerdict(self::API, '7', 't', 3, ['cwolsen']);
+        $this->assertFalse($verdict['approved']);
+        $this->assertSame(['group_223_bot_x', 'agent-bot'], $verdict['ignored']);
     }
 
     /**
@@ -80,15 +100,15 @@ final class MergeApprovalServiceTest extends UbixConcreteClassOrEnumTestCase imp
      */
     public function testAThumbsUpCountsAndOtherEmojiDoNot(): void
     {
-        $this->givenMergeRequest('dev', [], [['olga', 'thumbsup']]);
-        $this->assertTrue($this->buildService()->getVerdict(self::API, '7', 't', 3, [])['approved']);
+        $this->givenMergeRequest('dev', [], [['cwolsen', 'thumbsup']]);
+        $this->assertTrue($this->buildService()->getVerdict(self::API, '7', 't', 3, ['cwolsen'])['approved']);
 
-        $this->givenMergeRequest('dev', [], [['olga', 'heart']]);
-        $this->assertFalse($this->buildService()->getVerdict(self::API, '7', 't', 3, [])['approved']);
+        $this->givenMergeRequest('dev', [], [['cwolsen', 'heart']]);
+        $this->assertFalse($this->buildService()->getVerdict(self::API, '7', 't', 3, ['cwolsen'])['approved']);
     }
 
     /**
-     * An author's own sign-off does not count, unless the author is an owner, and then it says so
+     * An author's own sign-off counts only when the author is an owner, and then it says so
      *
      * @return void
      */

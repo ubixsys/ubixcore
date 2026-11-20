@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### CI
+
+- **Changed (security):** the merge sign-off gate (`ci/require-approval.yml`,
+  `ci/bin/require-approval.sh` and `bin/ubix ci:requireApproval`) now counts an Approve or 👍
+  only from users listed in `UBIX_APPROVAL_OWNERS` / `MERGE_APPROVAL_OWNERS`. Before, any user
+  other than the author passed it, so a bot or agent token, or anyone able to 👍 a public MR,
+  could satisfy the gate. Other sign-offs are logged as "not counted". `ci:requireApproval`
+  now fails when no owners are set (the shell gate already did). Hosts: make sure every person
+  whose sign-off should count is in the owners list.
+
+### Agents
+
+- `CLAUDE.md` and the branching standard: agents now resolve review threads themselves once
+  they have replied with a `Fixed:` / `Dismissed:` / `Deferred:` marker, posting as their own
+  bot account; they still never approve, 👍, press merge or arm auto-merge.
+
 ### Database
 
 - New: optional `MYSQL_TIME_ZONE`. When set, every new MySQL connection (read, write and

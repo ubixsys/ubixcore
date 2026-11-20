@@ -4,8 +4,9 @@
 # bash, curl and jq. Inlined into ci/require-approval.yml by ci/bin/inline-require-approval.sh:
 # edit this file, never the copy in the yml. Spec: docs/ci-require-approval.md.
 #
-# Passes when the merge request has an Approve or a 👍 from someone other than its author,
-# or from its author when listed in UBIX_APPROVAL_OWNERS (the log says SELF SIGN-OFF).
+# Passes when the merge request has an Approve or a 👍 from a user listed in UBIX_APPROVAL_OWNERS,
+# the author included (the log says SELF SIGN-OFF). Anyone else's (another user, a bot, an agent
+# token) is logged as not counted, so no account outside the list can satisfy the gate.
 # Fails otherwise. Fails open (UNVERIFIED, exit 0) with no token or when GitLab is unreachable.
 #
 # Env: UBIX_APPROVAL_OWNERS (or MERGE_APPROVAL_OWNERS), APPROVAL_GITLAB_TOKEN (or
@@ -58,15 +59,16 @@ AUTHOR="$(jq -r '.author.username // empty' <<<"$MR")" || unverified "unreadable
 PEOPLE="$( { jq -r '.approved_by[]?.user.username // empty' <<<"$APPROVALS"
              jq -r '.[]? | select(.name == "thumbsup") | .user.username // empty' <<<"$AWARDS"; } | sort -u)" \
   || unverified "unreadable approvals"
-OTHERS="$(grep -vxF -- "$AUTHOR" <<<"$PEOPLE" | grep -v '^$' || true)"
-IS_OWNER=0; case ",$(tr -d ' ' <<<"$OWNERS")," in *",$AUTHOR,"*) IS_OWNER=1 ;; esac
-SELF=0; if [ -z "$OTHERS" ] && [ -n "$AUTHOR" ] && grep -qxF -- "$AUTHOR" <<<"$PEOPLE" && [ "$IS_OWNER" = 1 ]; then SELF=1; fi
+owner_list() { printf '%s' "$OWNERS" | tr ',' '\n' | tr -d ' ' | grep -v '^$'; }
+COUNTED="$(grep -xF -f <(owner_list) <<<"$PEOPLE" || true)"
+IGNORED="$(grep -vxF -f <(owner_list) <<<"$PEOPLE" | grep -v '^$' || true)"
+[ -n "$IGNORED" ] && echo "Not counted (not in UBIX_APPROVAL_OWNERS): $(paste -sd, - <<<"$IGNORED" | sed 's/,/, /g')."
 
-if [ -z "$OTHERS" ] && [ "$SELF" = 0 ]; then
-  echo "!$IID has no sign-off yet. Approve it (or give it a thumbs-up), then retry this job."; exit 1
+if [ -z "$COUNTED" ]; then
+  echo "!$IID has no sign-off from $OWNERS yet. Approve it (or give it a thumbs-up), then retry this job."; exit 1
 fi
-[ "$SELF" = 1 ] && echo "SELF SIGN-OFF: $AUTHOR approved their own !$IID (listed in UBIX_APPROVAL_OWNERS)."
-echo "!$IID signed off by $(paste -sd, - <<<"$PEOPLE" | sed 's/,/, /g')."
+[ "$COUNTED" = "$AUTHOR" ] && echo "SELF SIGN-OFF: $AUTHOR approved their own !$IID (listed in UBIX_APPROVAL_OWNERS)."
+echo "!$IID signed off by $(paste -sd, - <<<"$COUNTED" | sed 's/,/, /g')."
 
 # Opt-in: a verified sign-off arms merge-when-pipeline-succeeds, pinned to this commit.
 # Soft: any problem is a message, never a failure (the person can still merge by hand).
