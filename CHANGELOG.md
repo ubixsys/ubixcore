@@ -17,7 +17,8 @@
   `kubernetes`, so nothing changes when it is unset). A role on a `jwt` mount, or on a
   mount enabled under another name, could not log in before: the path was hard-coded.
   The value must be one path segment (letters, digits, `-`, `_`); anything else, such
-  as `jwt/x` or `../sys`, fails before the vault is contacted. New
+  as `jwt/x` or `../sys`, fails the login before the vault is contacted. Only the
+  service-account login reads it: with a static `VAULT_TOKEN` it is ignored. New
   `VaultService::loginWithServiceAccountJwt()`; `loginKubernetes()` is unchanged.
 - Fix: `VAULT_DB_STRATEGY` is an allowlist. Unset, `kv`, `dynamic` and `none` work as
   before; any other value (`Dynamic`, `dynmic`, `kv2`) used to run the `kv` strategy

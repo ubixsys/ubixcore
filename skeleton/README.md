@@ -78,7 +78,9 @@ revoked as soon as the reads are done; a static `VAULT_TOKEN` is never revoked.
 `VAULT_AUTH_PATH` names the auth mount the service-account login uses. It
 defaults to `kubernetes`; set it when the role lives elsewhere, such as a `jwt`
 mount that validates several clusters' tokens by public key. It must be a single
-path segment (letters, digits, `-`, `_`), and anything else fails at startup.
+path segment (letters, digits, `-`, `_`); anything else fails the login before
+the vault is contacted. Only the service-account login reads it, so with a static
+`VAULT_TOKEN` it is ignored.
 
 `VAULT_TEST_DB_KV_PATH` does the same for the PHPUnit connection, and its secret
 carries the **whole** connection — `host`, `port`, `database`, `username`,
