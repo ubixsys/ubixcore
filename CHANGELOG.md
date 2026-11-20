@@ -11,6 +11,27 @@
   server's time-zone tables loaded, so use `SYSTEM` or an offset where they are not. See
   `docs/standards/database.md` and `.env.example`.
 
+### uBixVault
+
+- `VAULT_AUTH_PATH` names the auth mount the service-account login uses (default
+  `kubernetes`, so nothing changes when it is unset). A role on a `jwt` mount, or on a
+  mount enabled under another name, could not log in before: the path was hard-coded.
+  The value must be one path segment (letters, digits, `-`, `_`); anything else, such
+  as `jwt/x` or `../sys`, fails the login before the vault is contacted. Only the
+  service-account login reads it: with a static `VAULT_TOKEN` it is ignored. New
+  `VaultService::loginWithServiceAccountJwt()`; `loginKubernetes()` is unchanged.
+- Fix: `VAULT_DB_STRATEGY` is an allowlist. Unset, `kv`, `dynamic` and `none` work as
+  before; any other value (`Dynamic`, `dynmic`, `kv2`) used to run the `kv` strategy
+  silently and now fails at startup with an error naming it, before the cache or the
+  vault is consulted.
+- Fix: a 2xx Vault response whose body is not a JSON object or array (an HTML page from
+  a proxy, a truncated body, a bare `"ok"`) now fails as a `RuntimeException` naming the
+  path and status. It escaped as `DtoException` or `TypeError` before, past every
+  `@throws RuntimeException` on `VaultService` and the resolver's fail-closed contract.
+  The decode error is not chained, only its class is named: its `JsonError` holds the
+  whole body, which a truncated KV response could make a secret. An empty body is still
+  an empty response.
+
 ### Docs
 
 - New: `docs/ci.md` — the CI pipeline doc (stages, jobs, the Kelpie include, and how

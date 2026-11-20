@@ -10,6 +10,7 @@ use GuzzleHttp\Handler\MockHandler;
 use GuzzleHttp\HandlerStack;
 use GuzzleHttp\Middleware;
 use GuzzleHttp\Psr7\Response;
+use PHPUnit\Framework\Attributes\DataProvider;
 use Psr\Http\Message\RequestInterface as Request;
 use Psr\Log\LoggerInterface as Logger;
 use Psr\SimpleCache\CacheInterface as SimpleCache;
@@ -34,7 +35,7 @@ final class VaultCredentialResolverServiceTest extends UbixConcreteClassOrEnumTe
         'TEST_MYSQL_WRITE_HOST', 'TEST_MYSQL_WRITE_PORT', 'TEST_MYSQL_WRITE_DATABASE',
         'TEST_MYSQL_WRITE_USERNAME', 'TEST_MYSQL_WRITE_PASSWORD',
         'API_BEARER_TOKENS', 'lower_case_key', 'VAULT_ADDR_OVERRIDE', 'OWN_KEY', 'SHARED_KEY', 'OTHER_KEY',
-        'VAULT_CACHE_TTL',
+        'VAULT_CACHE_TTL', 'VAULT_AUTH_PATH',
     ];
 
     private const VAULT_ADDRESS = 'https://vault.test';
@@ -460,6 +461,47 @@ final class VaultCredentialResolverServiceTest extends UbixConcreteClassOrEnumTe
     }
 
     /**
+     * An explicit `kv` reads the KV secret exactly as unset does (the refusal message tells people to use it)
+     *
+     * @return void
+     */
+    public function testExplicitKvStrategyReadsTheKvSecret(): void
+    {
+        putenv('VAULT_TOKEN=test-token');
+        putenv('VAULT_DB_STRATEGY=kv');
+
+        $this->resolver([$this->kv(self::FULL_DB_SECRET)])->hydrateEnvironment(self::VAULT_ADDRESS);
+
+        $this->assertSame('writer', getenv('MYSQL_WRITE_USERNAME'));
+        $this->assertSame(self::VAULT_ADDRESS . '/v1/secret/data/app/db', (string) $this->requests[0]->getUri());
+    }
+
+    /**
+     * An unknown VAULT_DB_STRATEGY is refused by name before the vault is contacted, not run as `kv`
+     *
+     * @param string $strategy The unknown value
+     *
+     * @return void
+     */
+    #[DataProvider('unknownStrategies')]
+    public function testUnknownStrategyIsRefusedByName(string $strategy): void
+    {
+        putenv('VAULT_TOKEN=test-token');
+        putenv('VAULT_DB_STRATEGY=' . $strategy);
+        putenv('MYSQL_WRITE_PASSWORD=stale');
+
+        try {
+            $this->resolver([$this->kv(self::FULL_DB_SECRET)], null, $this->arrayCache())->hydrateEnvironment(self::VAULT_ADDRESS);
+            $this->fail('Expected VAULT_DB_STRATEGY=' . $strategy . ' to be refused');
+        } catch (RuntimeException $exception) {
+            $this->assertStringContainsString('VAULT_DB_STRATEGY=`' . $strategy . '` is not a known strategy', $exception->getMessage());
+        }
+
+        $this->assertSame([], $this->requests, 'Nothing is read from the vault');
+        $this->assertSame('stale', getenv('MYSQL_WRITE_PASSWORD'), 'The environment is left as it was');
+    }
+
+    /**
      * Cache entries made under none are kept apart from the default strategy's (the key includes the strategy)
      *
      * @return void
@@ -610,6 +652,59 @@ final class VaultCredentialResolverServiceTest extends UbixConcreteClassOrEnumTe
 
         $this->assertCount(3, $this->requests);
         $this->assertSame(self::VAULT_ADDRESS . '/v1/auth/token/revoke-self', (string) $this->requests[2]->getUri());
+    }
+
+    /**
+     * Without VAULT_AUTH_PATH the service-account login goes to the `kubernetes` mount
+     *
+     * @return void
+     */
+    public function testServiceAccountLoginDefaultsToTheKubernetesMount(): void
+    {
+        putenv('VAULT_K8S_ROLE=app');
+
+        $this->resolver([$this->json(['auth' => ['client_token' => 'hvs.minted']]), $this->kv(self::FULL_DB_SECRET), new Response(204)])
+            ->hydrateEnvironment(self::VAULT_ADDRESS);
+
+        $this->assertSame(self::VAULT_ADDRESS . '/v1/auth/kubernetes/login', (string) $this->requests[0]->getUri());
+    }
+
+    /**
+     * VAULT_AUTH_PATH selects the mount, e.g. a `jwt` mount, with the same role and JWT
+     *
+     * @return void
+     */
+    public function testAuthPathSelectsTheLoginMount(): void
+    {
+        putenv('VAULT_K8S_ROLE=app');
+        putenv('VAULT_AUTH_PATH=jwt');
+
+        $this->resolver([$this->json(['auth' => ['client_token' => 'hvs.minted']]), $this->kv(self::FULL_DB_SECRET), new Response(204)])
+            ->hydrateEnvironment(self::VAULT_ADDRESS);
+
+        $this->assertSame(self::VAULT_ADDRESS . '/v1/auth/jwt/login', (string) $this->requests[0]->getUri());
+        $this->assertSame('{"jwt":"the.pod.jwt","role":"app"}', (string) $this->requests[0]->getBody());
+        $this->assertSame('writer', getenv('MYSQL_WRITE_USERNAME'));
+    }
+
+    /**
+     * A VAULT_AUTH_PATH that is not one path segment fails before the vault is contacted
+     *
+     * @return void
+     */
+    public function testUnsafeAuthPathFailsBeforeContactingVault(): void
+    {
+        putenv('VAULT_K8S_ROLE=app');
+        putenv('VAULT_AUTH_PATH=../../sys');
+
+        try {
+            $this->resolver([$this->json(['auth' => ['client_token' => 'hvs.minted']])])->hydrateEnvironment(self::VAULT_ADDRESS);
+            $this->fail('Expected an unsafe VAULT_AUTH_PATH to be refused');
+        } catch (RuntimeException $exception) {
+            $this->assertStringContainsString('`../../sys`', $exception->getMessage());
+        }
+
+        $this->assertSame([], $this->requests);
     }
 
     /**
@@ -792,6 +887,22 @@ final class VaultCredentialResolverServiceTest extends UbixConcreteClassOrEnumTe
         }
 
         $this->assertSame('stale', getenv('MYSQL_WRITE_PASSWORD'));
+    }
+
+    /**
+     * VAULT_DB_STRATEGY values that are not `kv`, `dynamic` or `none`
+     *
+     * @return array<string, array{0: string}>
+     */
+    public static function unknownStrategies(): array
+    {
+        return [
+            'capitalised dynamic' => ['Dynamic'],
+            'capitalised none'    => ['None'],
+            'kv2'                 => ['kv2'],
+            'typo'                => ['dynmic'],
+            'unrelated'           => ['vault'],
+        ];
     }
 
     /**

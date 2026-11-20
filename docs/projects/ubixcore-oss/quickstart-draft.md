@@ -119,13 +119,15 @@ The skeleton installs a pre-push hook that runs this; a red gate blocks the push
 uBixCore reads credentials from **uBixVault**. Set `VAULT_ADDR` (and
 `VAULT_TOKEN` locally, or `VAULT_K8S_ROLE` in Kubernetes) and the bootstrap
 pulls `MYSQL_*` from the KV secret at `VAULT_DB_KV_PATH` on every start. `.env`
-is for local development only and stays out of git.
+is for local development only and stays out of git. The Kubernetes login goes
+to the `kubernetes` auth mount unless `VAULT_AUTH_PATH` names another (e.g.
+`jwt`).
 
 An app with no database sets `VAULT_DB_STRATEGY=none`: the `MYSQL_*` read is
 skipped and only the app secrets at `VAULT_APP_KV_PATH` / `VAULT_APP_KV_PATHS`
 are hydrated. Leave it unset for an app that has a database, so a missing
 database secret still fails loudly. (`kv`, the default, and `dynamic` are the
-other values.) Do the same for CI tokens
+other values; anything else stops startup with an error naming it.) Do the same for CI tokens
 and webhooks: Vault + a read-only token in the pipeline.
 
 ## 8. Database + migrations

@@ -121,6 +121,47 @@ final class VaultServiceTest extends UbixConcreteClassOrEnumTestCase implements 
     }
 
     /**
+     * A service-account login on another mount POSTs the same body to /v1/auth/<mount>/login
+     *
+     * @return void
+     */
+    public function testLoginWithServiceAccountJwtUsesTheGivenMount(): void
+    {
+        $token = $this->service([$this->json(['auth' => ['client_token' => 'hvs.issued']])])
+            ->loginWithServiceAccountJwt(self::VAULT_ADDRESS, 'jwt', 'kitg-api', 'the.jwt.value');
+
+        $this->assertSame('hvs.issued', $token);
+
+        $request = $this->onlyRequest();
+        $this->assertSame('POST', $request->getMethod());
+        $this->assertSame(self::VAULT_ADDRESS . '/v1/auth/jwt/login', (string) $request->getUri());
+        $this->assertFalse($request->hasHeader('X-Vault-Token'), 'Login is unauthenticated; no token header is sent');
+        $this->assertSame(['jwt' => 'the.jwt.value', 'role' => 'kitg-api'], $this->decodeBody($request));
+    }
+
+    /**
+     * A mount that is not one safe path segment is refused before any request is sent
+     *
+     * @param string $authPath The rejected mount
+     *
+     * @return void
+     */
+    #[DataProvider('unsafeAuthPaths')]
+    public function testLoginWithServiceAccountJwtRefusesAnUnsafeMount(string $authPath): void
+    {
+        try {
+            $this->service([$this->json(['auth' => ['client_token' => 'hvs.issued']])])
+                ->loginWithServiceAccountJwt(self::VAULT_ADDRESS, $authPath, 'kitg-api', 'jwt');
+            $this->fail('Expected an unsafe mount to be refused');
+        } catch (RuntimeException $exception) {
+            $this->assertStringContainsString('VAULT_AUTH_PATH must be a single path segment', $exception->getMessage());
+            $this->assertStringContainsString('`' . $authPath . '`', $exception->getMessage(), 'The bad value is named');
+        }
+
+        $this->assertSame([], $this->requests, 'Nothing is sent to the vault');
+    }
+
+    /**
      * A KV v2 read GETs /v1/secret/data/<path> with the token and returns the inner data map
      *
      * @return void
@@ -234,6 +275,46 @@ final class VaultServiceTest extends UbixConcreteClassOrEnumTestCase implements 
     }
 
     /**
+     * A 2xx whose body is not a JSON object or array fails as a RuntimeException, and the body
+     * (which a truncated KV response could make a secret) appears nowhere in the exception chain
+     *
+     * @param string $body  The undecodable response body
+     * @param string $cause The decode error's class, the only part of it that is kept
+     *
+     * @return void
+     */
+    #[DataProvider('undecodableBodies')]
+    public function testUndecodable2xxBodyThrowsRuntimeException(string $body, string $cause): void
+    {
+        $logger = $this->createMock(Logger::class);
+        $logger->expects($this->once())
+            ->method('error')
+            ->with('uBix Vault response was not decodable JSON', ['cause' => $cause, 'method' => 'GET', 'path' => '/v1/secret/data/app/db', 'status' => 200]);
+
+        try {
+            $this->service([new Response(200, ['Content-Type' => 'text/html'], $body)], $logger)
+                ->readKvV2Secret(self::VAULT_ADDRESS, self::TOKEN, 'app/db');
+            $this->fail('Expected a RuntimeException for an undecodable body');
+        } catch (RuntimeException $exception) {
+            $this->assertSame('uBix Vault request to `/v1/secret/data/app/db` returned a 200 whose body is not a JSON object or array (' . $cause . ')', $exception->getMessage());
+            $this->assertNull($exception->getPrevious(), 'The decode error carries the body, so it is not chained');
+        }
+    }
+
+    /**
+     * An empty 2xx body (e.g. revoke-self's 204) is still an empty response, not a decode failure
+     *
+     * @return void
+     */
+    public function testEmpty2xxBodyIsAnEmptyResponse(): void
+    {
+        $this->expectException(RuntimeException::class);
+        $this->expectExceptionMessage('KV read for `app/db` returned no data map');
+
+        $this->service([new Response(200, [], " \n")])->readKvV2Secret(self::VAULT_ADDRESS, self::TOKEN, 'app/db');
+    }
+
+    /**
      * A transport failure is logged without the token and surfaced as a RuntimeException
      *
      * @return void
@@ -288,6 +369,43 @@ final class VaultServiceTest extends UbixConcreteClassOrEnumTestCase implements 
             'no auth block'      => [['errors' => ['permission denied']]],
             'no client_token'    => [['auth' => ['policies' => ['default']]]],
             'non-string token'   => [['auth' => ['client_token' => 12345]]],
+        ];
+    }
+
+    /**
+     * Auth mounts that are not one safe path segment
+     *
+     * @return array<string, array{0: string}>
+     */
+    public static function unsafeAuthPaths(): array
+    {
+        return [
+            'dot'              => ['.'],
+            'dot dot'          => ['..'],
+            'dotted name'      => ['jwt.prod'],
+            'empty'            => [''],
+            'encoded slash'    => ['jwt%2Fx'],
+            'leading slash'    => ['/jwt'],
+            'nested'           => ['jwt/x'],
+            'query'            => ['jwt?x=1'],
+            'space'            => ['my jwt'],
+            'trailing newline' => ["jwt\n"],
+            'traversal'        => ['../../sys'],
+        ];
+    }
+
+    /**
+     * 2xx bodies that do not decode to a JSON object or array
+     *
+     * @return array<string, array{0: string, 1: string}>
+     */
+    public static function undecodableBodies(): array
+    {
+        return [
+            'html error page' => ['<html><body>502 Bad Gateway</body></html>', 'DtoException'],
+            'json number'     => ['1', 'TypeError'],
+            'json string'     => ['"ok"', 'TypeError'],
+            'truncated json'  => ['{"data":{"data":{"password":"s3cret"', 'DtoException'],
         ];
     }
 
