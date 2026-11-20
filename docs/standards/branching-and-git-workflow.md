@@ -275,7 +275,7 @@ The `code:review` pre-push hook still runs on every push (now guarding your feat
 
 **Break-glass (and why there is no standing exception).** Nobody — including the Maintainer who owns the tooling — keeps direct push access. The emergency path is MR-first even for hotfixes: a broken pipeline cannot deadlock a merge ("pipelines must succeed" is deliberately OFF and the review job is `allow_failure`, so an MR with resolved threads merges even while CI is down). For a true break-glass (GitLab itself misbehaving), the Maintainer toggles the `dev` protection, pushes, toggles it back, and announces the act in `#the original monorepo-alerts` — the toggle is deliberate, audited, and temporary, which is exactly what separates an emergency from an exception.
 
-**Working the review threads — every finding gets a recorded decision.** A resolved thread means "a human decided", not "fixed" — the *what* must be machine-readable, because later reporting (fix-rate vs dismiss-rate vs deferral debt per finding class) parses the resolution comments. **Start every resolution comment with one of three markers:**
+**Working the review threads — every finding gets a recorded decision.** A resolved thread means "a decision was recorded", not "fixed". Agents resolve a thread themselves once they have replied with one of the markers below (as their bot account, never the owner's); a thread with no answer stays open. The *what* must be machine-readable, because later reporting (fix-rate vs dismiss-rate vs deferral debt per finding class) parses the resolution comments. **Start every resolution comment with one of three markers:**
 
 | Marker | Means | Example |
 |---|---|---|
@@ -295,9 +295,11 @@ team where every MR is opened under the owner's account (an author cannot approv
 so nothing would ever merge).
 
 - **The check:** `bin/ubix ci:requireApproval` (`Ubix\Service\Ci\MergeApprovalService`). It
-  passes when the MR has an Approve or a 👍 from anyone but its author, or from its author when
-  the author is listed in `MERGE_APPROVAL_OWNERS`; the log says **SELF SIGN-OFF** when that
-  happens, so a pushed-through merge is recorded rather than invisible. On a branch pipeline,
+  passes when the MR has an Approve or a 👍 from a user listed in `MERGE_APPROVAL_OWNERS`, the
+  author included; the log says **SELF SIGN-OFF** when the author is the only one, so a
+  pushed-through merge is recorded rather than invisible. Anyone else's sign-off (another user,
+  Kelpie, an agent's bot token) is logged as not counted: no account outside the list can
+  satisfy the gate. No owners listed fails the job. On a branch pipeline,
   which carries no MR variables, it finds the MR by source branch.
 - **It blocks because "Pipelines must succeed" is ON.** Without that setting the job is only a
   red mark.
@@ -309,8 +311,10 @@ so nothing would ever merge).
   and the merge button unlocks.
 - **It fails open.** No token, or GitLab unreachable: the job passes with an `UNVERIFIED` line
   rather than holding every merge hostage to an outage.
-- **Agents never approve and never 👍.** Agent sessions run under the owner's account, so the
-  API would let them; the rule is what keeps the click meaning "the owner looked at this".
+- **Agents never approve, never 👍 and never merge.** They do not press the merge button or arm
+  merge-when-pipeline-succeeds; the owner merges. Agents post as their own bot account, and the
+  owners-only check means a bot's sign-off would not count anyway; the rule is what keeps the
+  click meaning "the owner looked at this".
 - **Honest limit:** a guard against merging in haste, not a security boundary. A click costs
   nothing to make unread.
 

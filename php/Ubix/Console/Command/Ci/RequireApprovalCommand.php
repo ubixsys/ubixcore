@@ -20,8 +20,8 @@ use Ubix\Service\Ci\MergeApprovalService;
  * `docs/standards/branching-and-git-workflow.md` § Merge sign-off.
  *
  * Settings from the job's environment: `APPROVAL_GITLAB_TOKEN` (falls back to
- * `AI_REVIEW_GITLAB_TOKEN`), optional `MERGE_APPROVAL_OWNERS` (comma-separated usernames
- * who may sign off on their own MRs), and GitLab's predefined `CI_*` variables.
+ * `AI_REVIEW_GITLAB_TOKEN`), `MERGE_APPROVAL_OWNERS` (comma-separated usernames whose Approve or
+ * thumbs-up counts, the author included; required), and GitLab's predefined `CI_*` variables.
  *
  * Fails open: no token, or GitLab unreachable, passes with a warning rather than holding
  * every merge hostage to an outage.
@@ -52,8 +52,8 @@ final class RequireApprovalCommand extends Command
     {
         $this->setDescription('CI only: fail until this pipeline\'s merge request has a human sign-off')->setHelp(
             <<<'HELP'
-Passes when the merge request has an Approve or a thumbs-up from someone other than its
-author, or from its author when listed in MERGE_APPROVAL_OWNERS. Fails otherwise. With
+Passes when the merge request has an Approve or a thumbs-up from a user listed in
+MERGE_APPROVAL_OWNERS (the author included). Anyone else's does not count. Fails otherwise. With
 "Pipelines must succeed" on, that makes sign-off a merge requirement. After approving,
 retry the job: GitLab does not re-run pipelines on approval.
 
@@ -82,6 +82,12 @@ HELP,
             return $name !== '';
         }));
 
+        if ($owners === []) {
+            $output->writeln('<error>require-approval: set MERGE_APPROVAL_OWNERS to the usernames whose Approve or thumbs-up counts.</error>');
+
+            return Command::FAILURE;
+        }
+
         try {
             $iid = $this->env('CI_MERGE_REQUEST_IID') !== '' ? (int) $this->env('CI_MERGE_REQUEST_IID') : $this->mergeApprovalService->getOpenMergeRequestIid($apiUrl, $projectId, $token, $this->env('CI_COMMIT_BRANCH'));
 
@@ -98,8 +104,12 @@ HELP,
             return Command::SUCCESS;
         }
 
+        if ($verdict['ignored'] !== []) {
+            $output->writeln('<comment>Not counted (not in MERGE_APPROVAL_OWNERS): ' . implode(', ', $verdict['ignored']) . '.</comment>');
+        }
+
         if (!$verdict['approved']) {
-            $output->writeln('<error>!' . $iid . ' has no sign-off yet. Approve it (or give it a thumbs-up), then retry this job.</error>');
+            $output->writeln('<error>!' . $iid . ' has no sign-off from ' . implode(', ', $owners) . ' yet. Approve it (or give it a thumbs-up), then retry this job.</error>');
 
             return Command::FAILURE;
         }

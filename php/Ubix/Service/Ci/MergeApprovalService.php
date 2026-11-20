@@ -74,18 +74,19 @@ final class MergeApprovalService
     /**
      * Who has signed off on an MR, and whether that is enough
      *
-     * A sign-off is an Approve or a thumbs-up from anyone but the author, or from the author
-     * when the author is one of `$owners`.
+     * A sign-off is an Approve or a thumbs-up from one of `$owners`, the author included when listed.
+     * Anyone else's (another user, a bot or an agent token) is reported but does not count, so the
+     * gate cannot be satisfied by an account that is not a listed owner. No owners means nothing counts.
      *
      * @param string   $apiUrl    GitLab API v4 base URL
      * @param string   $projectId Project id
      * @param string   $token     API token (read access)
      * @param int      $iid       MR iid
-     * @param string[] $owners    Usernames allowed to sign off on their own MRs
+     * @param string[] $owners    Usernames whose Approve or thumbs-up counts
      *
      * GitLab failures surface as RuntimeException.
      *
-     * @return array{approved: bool, author: string, signedOffBy: list<string>, selfSignOff: bool} The verdict
+     * @return array{approved: bool, author: string, signedOffBy: list<string>, selfSignOff: bool, ignored: list<string>} The verdict
      */
     public function getVerdict(string $apiUrl, string $projectId, string $token, int $iid, array $owners): array
     {
@@ -109,12 +110,13 @@ final class MergeApprovalService
         $people      = array_values(array_unique(array_filter($people, static function (string $name): bool {
             return $name !== '';
         })));
-        $others      = array_values(array_filter($people, static function (string $name) use ($author): bool {
-            return $name !== $author;
+        $counted     = array_values(array_filter($people, static function (string $name) use ($owners): bool {
+            return in_array($name, $owners, true);
         }));
-        $selfSignOff = $others === [] && in_array($author, $people, true) && in_array($author, $owners, true);
+        $ignored     = array_values(array_diff($people, $counted));
+        $selfSignOff = $counted === [$author];
 
-        return ['approved' => $others !== [] || $selfSignOff, 'author' => $author, 'signedOffBy' => $people, 'selfSignOff' => $selfSignOff];
+        return ['approved' => $counted !== [], 'author' => $author, 'signedOffBy' => $counted, 'selfSignOff' => $selfSignOff, 'ignored' => $ignored];
     }
 
     /**
