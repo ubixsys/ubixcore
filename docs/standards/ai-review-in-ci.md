@@ -4,11 +4,12 @@
 **Date:** 2026-09-30
 **Status:** Active
 
-A review of each merge request by an LLM, run on the GitLab runner, that a **human has to
-read before the MR merges**. Each finding becomes its own resolvable thread — inline on its
+A review of each merge request by an LLM, run on the GitLab runner, whose findings must each
+get a recorded decision before the MR merges. Each finding becomes its own resolvable thread — inline on its
 line when the diff has that line — plus one summary thread, posted even when the verdict is
 "Nothing worth raising". With the project setting **All threads must be resolved**, the merge
-waits until a person has resolved every one. The model never approves and never resolves;
+waits until every one is resolved, by a person or by an agent that has answered it (§4); the
+owner's sign-off is what says a person has looked. The model never approves and never resolves;
 the job itself stays `allow_failure`, so an outage cannot wedge a merge, but a failed run
 still posts a "NOT reviewed — review this one yourself" thread that must be resolved. Local
 review, with whatever AI each developer uses, is separate and unaffected.
@@ -122,13 +123,20 @@ default and every run times out.
 
 ## 4. Working the threads
 
-Resolve a thread once you have decided, and say what you decided — start the reply with
+Resolve a thread once it is decided, and say what was decided: start the reply with
 `Fixed:` (code changed), `Dismissed:` (deliberately not; the reason is the record) or
-`Deferred:` (accepted, with where it is tracked). Suggested, not enforced: a resolved thread
-should mean "a person decided", and the reply is how anyone can tell later.
+`Deferred:` (accepted, with where it is tracked). A resolved thread means "a decision was
+recorded", and the reply is how anyone can tell later who decided what.
 
-**Agents never resolve AI-review threads.** Agent sessions often run under a person's account,
-so the API would let them; resolving on someone's behalf empties the gate.
+**Agents resolve the threads they have answered** (owner's decision, 2026-11-20). An agent that
+fixed a finding or dismissed it with a written reason replies with the marker, then resolves the
+thread, posting as its own bot account rather than a person's. It never resolves a thread it
+has not answered. The trade-off, stated plainly: "All threads must be resolved" no longer proves a
+person read every finding. That guarantee moves to the **merge sign-off** (branching standard §
+Merge sign-off): the owner's Approve or 👍, which only users in the owners list can give and no
+agent or bot can, plus the merge button, which stays a person's click. The reply on every
+resolved thread is what the owner reads before signing off; a thread an agent cannot settle stays
+open for the owner.
 
 ## 5. Turning it on
 
