@@ -3,7 +3,7 @@
 #
 #   include:
 #     - project: ubixsys/ubixcore
-#       ref: v0.47.0
+#       ref: vX.Y.Z   # a v* tag that ships this file; see the docs for which
 #       file: ci/require-approval.yml
 #   variables:
 #     UBIX_APPROVAL_OWNERS: "cwolsen"
