@@ -13,7 +13,7 @@ the same gate (set `UBIX_APPROVAL_OWNERS` there). Do not include both.
 ```yaml
 include:
   - project: ubixsys/ubixcore
-    ref: v0.47.0          # a v* release tag; see the note below
+    ref: v0.47.0          # stand-in: rewritten to the newest tag at each release; see the note below
     file: ci/require-approval.yml
 
 variables:
@@ -21,8 +21,9 @@ variables:
 ```
 
 **Tags up to and including v0.47.0 do not contain this file**, so an include at one of them
-does not resolve. Use a later tag. If none exists yet, pin a `main` commit SHA
-(`ref: <40-character sha>`) and move to a tag once one ships it.
+does not resolve, and until a later tag ships, the `ref:` above is only a stand-in. Use a
+later tag. If none exists yet, pin a `main` commit SHA (`ref: <40-character sha>`) and move
+to a tag once one ships it.
 
 That is all the YAML. It works with any `stages:` list (or none): the job runs in `.post`,
 which every pipeline has, after everything else. The script is inlined in the file, so there is
