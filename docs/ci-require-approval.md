@@ -20,10 +20,9 @@ variables:
   UBIX_APPROVAL_OWNERS: "cwolsen"
 ```
 
-**This file first ships in the release after v0.47.0.** v0.47.0 predates it, so an include
-at that tag does not resolve. Until the next tag exists, pin a `main` commit SHA instead
-(`ref: <40-character sha>`) and switch to the tag once it is out. The `ref:` line above is
-rewritten to the newest tag at each release, so from that release on it is correct as shown.
+**Tags up to and including v0.47.0 do not contain this file**, so an include at one of them
+does not resolve. Use a later tag. If none exists yet, pin a `main` commit SHA
+(`ref: <40-character sha>`) and move to a tag once one ships it.
 
 That is all the YAML. It works with any `stages:` list (or none): the job runs in `.post`,
 which every pipeline has, after everything else. The script is inlined in the file, so there is
