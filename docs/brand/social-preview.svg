@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 640" width="1280" height="640">
+  <title>uBixCore: An application framework that ships with its tooling.</title>
+  <rect width="1280" height="640" fill="#151b21"/>
+  <rect x="0" y="0" width="1280" height="8" fill="#0f62fe"/>
+  <g transform="translate(80 80) scale(3.75)">
+    <rect width="32" height="32" fill="#0f62fe"/>
+    <g fill="#ffffff" opacity="0.55">
+      <rect x="5" y="5" width="6" height="6"/><rect x="13" y="5" width="6" height="6"/><rect x="21" y="5" width="6" height="6"/>
+      <rect x="5" y="13" width="6" height="6"/><rect x="21" y="13" width="6" height="6"/>
+      <rect x="5" y="21" width="6" height="6"/><rect x="13" y="21" width="6" height="6"/><rect x="21" y="21" width="6" height="6"/>
+    </g>
+    <rect x="13" y="13" width="6" height="6" fill="#ffffff"/>
+  </g>
+  <g font-family="'IBM Plex Sans', 'Helvetica Neue', Arial, sans-serif" fill="#e3e8ec">
+    <text x="80" y="300" font-size="112"><tspan font-weight="300">uBix</tspan><tspan font-weight="600">Core</tspan></text>
+    <text x="84" y="372" font-size="40" fill="#b3bec7">An application framework that ships with its tooling.</text>
+  </g>
+  <g fill="#3a4550">
+    <rect x="80" y="430" width="60" height="60"/><rect x="160" y="430" width="60" height="60"/><rect x="240" y="430" width="60" height="60"/>
+    <rect x="80" y="510" width="60" height="60"/><rect x="240" y="510" width="60" height="60"/>
+    <rect x="80" y="590" width="60" height="30"/><rect x="160" y="590" width="60" height="30"/><rect x="240" y="590" width="60" height="30"/>
+  </g>
+  <rect x="160" y="510" width="60" height="60" fill="#e0a43a"/>
+  <g fill="none" stroke-width="10" stroke-linejoin="round">
+    <path d="M220 540H520C620 540 660 450 760 450H1200" stroke="#2f7fb0"/>
+    <path d="M520 540H1200" stroke="#8a4fc0"/>
+    <path d="M520 540C620 540 660 610 760 610H1200" stroke="#b8406f"/>
+  </g>
+</svg>

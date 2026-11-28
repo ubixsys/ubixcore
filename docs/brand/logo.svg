@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 162 40" width="162" height="40">
+  <title>uBixCore</title>
+  <g transform="translate(4 4)">
+    <rect width="32" height="32" fill="#0f62fe"/>
+    <g fill="#ffffff" opacity="0.55">
+      <rect x="5" y="5" width="6" height="6"/><rect x="13" y="5" width="6" height="6"/><rect x="21" y="5" width="6" height="6"/>
+      <rect x="5" y="13" width="6" height="6"/><rect x="21" y="13" width="6" height="6"/>
+      <rect x="5" y="21" width="6" height="6"/><rect x="13" y="21" width="6" height="6"/><rect x="21" y="21" width="6" height="6"/>
+    </g>
+    <rect x="13" y="13" width="6" height="6" fill="#ffffff"/>
+  </g>
+  <text x="46" y="28" font-family="'IBM Plex Sans', 'Helvetica Neue', Arial, sans-serif" font-size="22" fill="#161616"><tspan font-weight="300">uBix</tspan><tspan font-weight="600">Core</tspan></text>
+</svg>
