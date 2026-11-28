@@ -268,8 +268,16 @@ require-approval:
   stage: approval
   tags: [shell]
   timeout: 5 minutes
+  # Both pipeline kinds. An MR here gets a branch pipeline and a merge request pipeline (the
+  # included kelpie-review runs only in the latter). GitLab's "Pipelines must succeed" looks at
+  # the MR's head pipeline, which is the merge request one, and the approval webhook retries
+  # the sign-off job in that same pipeline. Without the second rule the head pipeline had no
+  # sign-off job, so an unapproved MR could merge. In the MR pipeline the job may first fail
+  # to pull the -test image while the branch pipeline is still building it; it fails either
+  # way until someone signs off, and the retry after sign-off finds the image.
   rules:
     - if: $CI_COMMIT_BRANCH && $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
   variables:
     MERGE_APPROVAL_OWNERS: cwolsen
   script:
